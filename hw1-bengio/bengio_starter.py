@@ -86,32 +86,29 @@ class bengio( torch.nn.Module ):
 		# embeddings
 		self.C = nn.Embedding( self.V, self.m )
 		# hidden layer weights ( including biases d )
-		self.W1 = nn.Linear( self.n * self.m, self.h )
+		self.H = nn.Linear( self.n * self.m, self.h )
 		# output layer weights ( including biases b )
-		self.W2 = nn.Linear( self.h, self.V )
+		self.U = nn.Linear( self.h, self.V )
 
 
-	def forward( self, x ):
+	def forward( self, X_ ):
 		# perform a forward pass ( inference ) on a batch of concatenated word embeddings
 		# hint: it may be more efficient to pass a matrix of indices for the context, and
 		# perform a look-up and concatenation of the word embeddings on the GPU.
 
-		# assuming `x` is indices, look up and concatenate embeddings
-		x_ = self.C( x )
-		x_ = x_.view( x_.size( 0 ), -1 )
+		# assuming `X_` is indices, look up and concatenate embeddings
+		X = self.C( X_ )
+		X = X.view( X.size( 0 ), -1 )
 
-		h = self.activ_fn( self.W1( x_ ) )
-		W2h = self.W2( h )
+		h = self.activ_fn( self.H( X ) )
+		y = self.U( h )
 
-		log_probs = torch.log_softmax( W2h, dim=1 )
-		return log_probs
-
-		#return x
-
+		ln_probs = torch.log_softmax( y, dim=1 )
+		return ln_probs
 
 def train( model, opt ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
-	# your batches ( sub-corpora ), you can manually replicate the functionality of datafeeder() to present 
+	# your batches ( sub-corpora ). you can manually replicate the functionality of dataloader() to present 
 	# training examples to you model, you can manually calculate the probability assigned to the target 
 	# token using torch matrix operations ( note: a mask to isolate the target word in the numerator may help ), 
 	# calculate the negative average ln( prob ) over the batch and perform gradient descent.  you may want to loop
@@ -120,6 +117,40 @@ def train( model, opt ):
 	# you model after every epoch.
 	#
 	# inputs to your neural network can be either word embeddings or word look-up indices
+
+	n, batch_sz = opt.window, opt.batchsize
+
+	batch_cnt = ( len( opt.train ) - n ) // batch_s.toz
+
+	model.train()
+
+	for i_batch in range( batch_cnt ):
+		batch_base = i * batch_sz
+		ctx_bases = [ batch_base + i_ctx for i_ctx in range( batch_sz ) ]
+		# contexts in batch; each element is a tensor of wIDs in a given context
+		X = torch.stack(
+			[\
+				torch.tensor( opt.train[ ctx_base : ctx_base+n ] )\
+				for ctx_base in ctx_bases\
+			]
+		)
+		# targets in batch corresponding to each context
+		y = torch.tensor(
+			[ opt.train( [ ctx_base+n ] ) for ctx_base in ctx_bases ]
+		)
+
+		if not opt.no_cuda:
+			X, y = X.cuda(), y.cuda()
+
+		opt.optimizer.zero_grad()
+		ln_probs = model( X ) 
+
+		loss = F.nll_loss( ln_probs, y )
+		loss.backward()
+		opt.optimizer.step()
+
+		if i % 1024 == 0:
+			print( f"batch { i_batch }/{ batch_cnt }, loss { loss.item():f}" )
 
 	if opt.savename:
 		torch.save( model.state_dict(), opt.savename + "/model_weights" )
@@ -131,9 +162,9 @@ def test_model( model, opt, epoch ):
 	return
 
 def main():
-	
+
 	random.seed( 10 )
-	
+
 	parser = argparse.ArgumentParser()
 	parser.add_argument( "-threshold", type=int, default=3 )
 	parser.add_argument( "-window",    type=int, default=512 )   
