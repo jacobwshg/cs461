@@ -173,7 +173,7 @@ def train( model, opt, dev ):
 	batch_cnt = ( len( opt.train ) - ctx_sz ) // batch_sz
 	toks_per_batch = ctx_sz * batch_sz # counting token overlaps between contexts
 
-	LOG_INTERVAL = 1024
+	LOG_INTERVAL = 2048
 	starttime = time.time()
 	tok_cnt = 0
 
@@ -197,7 +197,7 @@ def train( model, opt, dev ):
 
 		if i_batch % LOG_INTERVAL == 0:
 			delta_time = time.time() - starttime
-			wps = tok_cnt // delta_time
+			wps = tok_cnt / delta_time
 			ppl = torch.exp( loss ).item() # synch
 			progress = ( i_batch / batch_cnt ) * 100
 
@@ -205,7 +205,7 @@ def train( model, opt, dev ):
 				f"batch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
 				f"\tloss { loss.item():4f}, "
 				f"\tperplexity { ppl:.2f}, "
-				f"\tspeed: { wps } wps"
+				f"\tspeed: { wps:.2f} wps"
 			)
 
 			tok_cnt = 0
@@ -222,7 +222,7 @@ def test_model( model, opt, epoch, dev ):
 	ctx_sz, batch_sz = opt.window, opt.batchsize
 	batch_cnt = ( len( opt.test ) - ctx_sz ) // batch_sz
 
-	test_tsr = torch.LongTensor( opt.test )
+	test_tsr = torch.LongTensor( opt.test ).to( dev )
 
 	sampl_cnt = 0
 	correct_cnt = 0
