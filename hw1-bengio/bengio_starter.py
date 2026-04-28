@@ -3,6 +3,7 @@ import argparse
 import random
 
 import time
+from datetime import datetime as dt
 
 import torch
 import torch.nn as nn
@@ -179,43 +180,55 @@ def train( model, opt, dev ):
 
 	model.train()
 
-	for i_batch in range( batch_cnt ):
+	epochs = max( 1, opt.epochs )
+	for e in range( epochs ):
 
-		batch_base = i_batch * batch_sz
+		print( "training epoch", e )
+		print( "starttime: ", dt.ctime( dt.now() ) )
+		
+		for i_batch in range( batch_cnt ):
 
-		X, y_true = make_batch( train_tsr, ctx_sz, batch_base, batch_sz )
+			batch_base = i_batch * batch_sz
 
-		pred_ln_probs = model( X ) 
-		# mean loss across batch
-		loss = cross_entropy_loss( pred_ln_probs, y_true )
+			X, y_true = make_batch( train_tsr, ctx_sz, batch_base, batch_sz )
 
-		opt.optimizer.zero_grad()
-		loss.backward()
-		opt.optimizer.step()
+			pred_ln_probs = model( X ) 
+			# mean loss across batch
+			loss = cross_entropy_loss( pred_ln_probs, y_true )
 
-		tok_cnt += toks_per_batch
+			opt.optimizer.zero_grad()
+			loss.backward()
+			opt.optimizer.step()
 
-		if i_batch % LOG_INTERVAL == 0:
-			delta_time = time.time() - starttime
-			wps = tok_cnt / delta_time
-			ppl = torch.exp( loss ).item() # synch
-			progress = ( i_batch / batch_cnt ) * 100
+			tok_cnt += toks_per_batch
 
-			print(
-				f"batch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
-				f"\tloss { loss.item():4f}, "
-				f"\tperplexity { ppl:.2f}, "
-				f"\tspeed: { wps:.2f} wps"
-			)
+			if i_batch % LOG_INTERVAL == 0:
+				now = dt.now()
+				hms = f"{ now.hour:02d}:{ now.minute:02d}:{ now.second:02d}"
 
-			tok_cnt = 0
-			starttime = time.time()
+				delta_time = time.time() - starttime
+				wps = tok_cnt / delta_time
+				ppl = torch.exp( loss ).item() # synch
+				progress = ( i_batch / batch_cnt ) * 100
 
-	if opt.savename:
-		torch.save( model.state_dict(), opt.savename + "/model_weights" )
-	return
+				print(
+					f"{ hms }"
+					f"\tbatch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
+					f"\tloss { loss.item():4f}, "
+					f"\tperplexity { ppl:.2f}, "
+					f"\tspeed: { wps:.2f} wps"
+				)
 
-def test_model( model, opt, epoch, dev ):
+				tok_cnt = 0
+				starttime = time.time()
+
+		print( "endtime: ", dt.ctime( dt.now() ) )
+
+		if opt.savename:
+			torch.save( model.state_dict(), opt.savename + "/model_weights" )
+
+
+def test_model( model, opt, dev ):
 	# functionality for this function is similar to train() except that you construct examples for the
 	# test or validation corpus; and you do not apply gradient descent.
 
@@ -250,6 +263,7 @@ def test_model( model, opt, epoch, dev ):
 	mean_loss = total_loss / sampl_cnt
 	ppl = torch.exp( torch.tensor( mean_loss ) )
 
+
 	print(
 		f"\nTest results"
 		f"\n\taccuracy: { acc:.3f}%"
@@ -269,7 +283,7 @@ def main():
 	parser.add_argument( "-d_model",   type=int, default=100 )
 	parser.add_argument( "-batchsize", type=int, default=128 )
 	parser.add_argument( "-lr",        type=float, default=5e-5 )
-	parser.add_argument( "-savename",  type=str )
+	parser.add_argument( "-savename",  type=str, default="." )
 	parser.add_argument( "-loadname",  type=str )
 
 	opt = parser.parse_args()
@@ -316,7 +330,7 @@ def main():
 	opt.optimizer = torch.optim.Adam( model.parameters(), lr=opt.lr, betas=( 0.9, 0.98 ), eps=1e-9 )
 
 	train( model, opt, dev )
-	test_model( model, opt, -1, dev )
+	test_model( model, opt, dev )
 
 if __name__ == "__main__":
 	main()
