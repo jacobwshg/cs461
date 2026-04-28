@@ -276,12 +276,12 @@ def main():
 	random.seed( 10 )
 
 	parser = argparse.ArgumentParser()
-	parser.add_argument( "-threshold", type=int, default=3 )
+	parser.add_argument( "-threshold", type=int, default=10 )
 	parser.add_argument( "-window",    type=int, default=5 )   
 	parser.add_argument( "-no_cuda",   action="store_true" )
 	parser.add_argument( "-epochs",    type=int, default=20 )
 	parser.add_argument( "-d_model",   type=int, default=100 )
-	parser.add_argument( "-batchsize", type=int, default=128 )
+	parser.add_argument( "-batchsize", type=int, default=512 )
 	parser.add_argument( "-lr",        type=float, default=5e-5 )
 	parser.add_argument( "-savename",  type=str, default="." )
 	parser.add_argument( "-loadname",  type=str )
@@ -301,6 +301,17 @@ def main():
 	print( "Vocab: %7d" % ( len( opt.vocab ) ) )
 	print( " " )
 
+	print( "threshold: ", opt.threshold )
+	print( "window: ",    opt.window )
+	print( "epochs: ",    opt.epochs )
+	print( "d_model: ",   opt.d_model )
+	print( "batchsize: ", opt.batchsize )
+
+	dev = torch.device(
+		"cuda" if ( torch.cuda.is_available and not opt.no_cuda ) else "cpu"
+	)
+	print( "device: ", dev )
+
 	opt.examples = []
 	with open( "examples.txt", "rt" ) as f:
 		for line in f:
@@ -314,10 +325,6 @@ def main():
 			print( "original: %s" % line )
 			print( "encoded:  %s" % text )
 			print( " " )
-
-	dev = torch.device(
-		"cuda" if ( torch.cuda.is_available and not opt.no_cuda ) else "cpu"
-	)
 
 	model = bengio( 
 		dim=opt.d_model, 
