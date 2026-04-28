@@ -189,9 +189,9 @@ def train( model, opt ):
 
 			print(
 				f"batch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
-				f"loss { loss.item():4f}, "
-				f"perplexity { ppl:.2f}, "
-				f"speed: { wps } wps"
+				f"\tloss { loss.item():4f}, "
+				f"\tperplexity { ppl:.2f}, "
+				f"\tspeed: { wps } wps"
 			)
 
 			tok_cnt = 0
@@ -237,10 +237,10 @@ def test_model( model, opt, epoch ):
 	ppl = torch.exp( torch.tensor( mean_loss ) )
 
 	print(
-		f"Test results"
-		f"\taccurary: { acc:.3f}%"
-		f"\tmean loss: { mean_loss:.4f}"
-		f"\tperplexity: { ppl:.4f}"
+		f"\nTest results"
+		f"\n\taccuracy: { acc:.3f}%"
+		f"\n\tmean loss: { mean_loss:.4f}"
+		f"\n\tperplexity: { ppl:.4f}"
 	)
 
 def main():
@@ -249,12 +249,12 @@ def main():
 
 	parser = argparse.ArgumentParser()
 	parser.add_argument( "-threshold", type=int, default=3 )
-	parser.add_argument( "-window",    type=int, default=32 )   
+	parser.add_argument( "-window",    type=int, default=5 )   
 	parser.add_argument( "-no_cuda",   action="store_true" )
 	parser.add_argument( "-epochs",    type=int, default=20 )
-	parser.add_argument( "-d_model",   type=int, default=64 )
-	parser.add_argument( "-batchsize", type=int, default=16 )
-	parser.add_argument( "-lr",        type=float, default=0.00001 )
+	parser.add_argument( "-d_model",   type=int, default=100 )
+	parser.add_argument( "-batchsize", type=int, default=128 )
+	parser.add_argument( "-lr",        type=float, default=5e-5 )
 	parser.add_argument( "-savename",  type=str )
 	parser.add_argument( "-loadname",  type=str )
 
