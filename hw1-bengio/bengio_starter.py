@@ -118,31 +118,44 @@ def cross_entropy_loss( pred_ln_probs, y_true ):
 	loss = -true_ln_probs.mean()
 	return loss
 
-def make_batch( corpus, wnd_sz, batch_base, batch_sz ):
+def make_batch( corp_tsr, ctx_sz, batch_base, batch_sz ):
 	#
 	# construct a batch of sample contexts and target words from `corpus`
 	# given context window size, batch base idx in corpus and batch size
 	#
 
+	#
 	# base indices of each context window in the corpus
-	ctx_bases = [ ctx_base for ctx_base in range( batch_base, batch_base + batch_sz ) ]
+	# shape ( 1, batch_sz )
+	#
+	ctx_bases = torch.arange( batch_base, batch_base + batch_sz ).unsqueeze( 1 )
 
-	# contexts in batch; each element is a tensor of word IDs in a given context
-	X = torch.stack(
-		[\
-			torch.tensor( corpus[ ctx_base : ctx_base + wnd_sz ] )\
-			for ctx_base in ctx_bases\
-		]
-	)
+	#
+	# offsets of each token within a window w.r.t. window base
+	# shape ( ctx_sz, 1 )
+	#
+	ctx_tok_offsets = torch.arange( ctx_sz ).unsqueeze( 0 )
 
+	#
+	# broadcast window token offsets
+	# get token indices within corpus
+	#
+	corp_tok_idxs = ctx_bases + ctx_tok_offsets
+
+	#
+	# contexts in batch as vectors of word IDs indexed from corpus tensor
+	#
+	X = corp_tsr[ corp_tok_idxs ]
+
+	#
 	# targets in batch corresponding to each context
-	y_true = torch.tensor(
-		[ corpus[ ctx_base + wnd_sz ] for ctx_base in ctx_bases ]
-	)
+	#
+	y_true = corp_tsr[ batch_base + ctx_sz : batch_base + ctx_sz + batch_sz ]
+
 	return X, y_true
 
 
-def train( model, opt ):
+def train( model, opt, dev ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
 	# your batches ( sub-corpora ). you can manually replicate the functionality of dataloader() to present 
 	# training examples to you model, you can manually calculate the probability assigned to the target 
@@ -154,9 +167,11 @@ def train( model, opt ):
 	#
 	# inputs to your neural network can be either word embeddings or word look-up indices
 
-	wnd_sz, batch_sz = opt.window, opt.batchsize
-	batch_cnt = ( len( opt.train ) - wnd_sz ) // batch_sz
-	toks_per_batch = wnd_sz * batch_sz # counting token overlaps between contexts
+	train_tsr = torch.LongTensor( opt.train ).to( dev )
+
+	ctx_sz, batch_sz = opt.window, opt.batchsize
+	batch_cnt = ( len( opt.train ) - ctx_sz ) // batch_sz
+	toks_per_batch = ctx_sz * batch_sz # counting token overlaps between contexts
 
 	LOG_INTERVAL = 1024
 	starttime = time.time()
@@ -167,9 +182,8 @@ def train( model, opt ):
 	for i_batch in range( batch_cnt ):
 
 		batch_base = i_batch * batch_sz
-		X, y_true = make_batch( opt.train, wnd_sz, batch_base, batch_sz )
-		if not opt.no_cuda:
-			X, y_true = X.cuda(), y_true.cuda()
+
+		X, y_true = make_batch( train_tsr, ctx_sz, batch_base, batch_sz )
 
 		pred_ln_probs = model( X ) 
 		# mean loss across batch
@@ -201,12 +215,14 @@ def train( model, opt ):
 		torch.save( model.state_dict(), opt.savename + "/model_weights" )
 	return
 
-def test_model( model, opt, epoch ):
+def test_model( model, opt, epoch, dev ):
 	# functionality for this function is similar to train() except that you construct examples for the
 	# test or validation corpus; and you do not apply gradient descent.
 
-	n, batch_sz = opt.window, opt.batchsize
-	batch_cnt = ( len( opt.test ) - n ) // batch_sz
+	ctx_sz, batch_sz = opt.window, opt.batchsize
+	batch_cnt = ( len( opt.test ) - ctx_sz ) // batch_sz
+
+	test_tsr = torch.LongTensor( opt.test )
 
 	sampl_cnt = 0
 	correct_cnt = 0
@@ -218,9 +234,7 @@ def test_model( model, opt, epoch ):
 		for i_batch in range( batch_cnt ):
 
 			batch_base = i_batch * batch_sz
-			X, y_true = make_batch( opt.test, n, batch_base, batch_sz )
-			if not opt.no_cuda:
-				X, y_true = X.cuda(), y_true.cuda()
+			X, y_true = make_batch( test_tsr, ctx_sz, batch_base, batch_sz )
 
 			pred_ln_probs = model( X )
 
@@ -288,21 +302,21 @@ def main():
 			print( " " )
 
 	dev = torch.device(
-		"cuda" if torch.cuda.is_available else "cpu"
+		"cuda" if ( torch.cuda.is_available and not opt.no_cuda ) else "cpu"
 	)
+
 	model = bengio( 
 		dim=opt.d_model, 
 		window=opt.window, 
 		batchsize=opt.batchsize, 
 		vocab_size=len( opt.vocab ), 
 		activation=torch.tanh
-	)
-	if not opt.no_cuda:
-		model = model.cuda()
+	).to( dev )
+
 	opt.optimizer = torch.optim.Adam( model.parameters(), lr=opt.lr, betas=( 0.9, 0.98 ), eps=1e-9 )
 
-	train( model, opt )
-	test_model( model, opt, -1 )
+	train( model, opt, dev )
+	test_model( model, opt, -1, dev )
 
 if __name__ == "__main__":
 	main()
