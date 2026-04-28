@@ -1,5 +1,8 @@
+
 import argparse
 import random
+
+import time
 
 import torch
 import torch.nn as nn
@@ -68,7 +71,7 @@ def encode( text, words ):
 class bengio( torch.nn.Module ):
 	def __init__( self, dim=50, window=3, batchsize=1, vocab_size=33279, activation=torch.tanh ):
 		super().__init__()
-		
+
 		# specify weights, activation functions and any "helper" function needed for the neural net
 
 		# activation
@@ -90,21 +93,30 @@ class bengio( torch.nn.Module ):
 		# output layer weights ( including biases b )
 		self.U = nn.Linear( self.h, self.V )
 
-
 	def forward( self, X_ ):
 		# perform a forward pass ( inference ) on a batch of concatenated word embeddings
 		# hint: it may be more efficient to pass a matrix of indices for the context, and
 		# perform a look-up and concatenation of the word embeddings on the GPU.
 
-		# assuming `X_` is indices, look up and concatenate embeddings
+		# assuming `X_` is word IDs in a given context, look up and concatenate embeddings
 		X = self.C( X_ )
 		X = X.view( X.size( 0 ), -1 )
 
 		h = self.activ_fn( self.H( X ) )
-		y = self.U( h )
+		y_pred = self.U( h )
 
-		ln_probs = torch.log_softmax( y, dim=1 )
-		return ln_probs
+		#
+		# |V| log probs, one for each vocabulary word ( including the true target
+		# following this context in the corpus )
+		#
+		pred_ln_probs = torch.log_softmax( y_pred, dim=1 )
+		return pred_ln_probs
+
+def cross_entropy_loss( pred_ln_probs, y_true )
+	sampl_cnt = pred_ln_probs.size( 0 )
+	true_ln_probs = pred_ln_probs[ torch.arange( sampl_cnt ), y_true ]
+	loss = -true_ln_probs.mean()
+	return loss
 
 def train( model, opt ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
@@ -119,15 +131,19 @@ def train( model, opt ):
 	# inputs to your neural network can be either word embeddings or word look-up indices
 
 	n, batch_sz = opt.window, opt.batchsize
+	batch_cnt = ( len( opt.train ) - n ) // batch_sz
+	toks_per_batch = n * batch_sz # counting token overlaps between contexts
 
-	batch_cnt = ( len( opt.train ) - n ) // batch_s.toz
+	LOG_INTERVAL = 1024
+	starttime = time.time()
+	tok_cnt = 0
 
 	model.train()
 
 	for i_batch in range( batch_cnt ):
 		batch_base = i * batch_sz
-		ctx_bases = [ batch_base + i_ctx for i_ctx in range( batch_sz ) ]
-		# contexts in batch; each element is a tensor of wIDs in a given context
+		ctx_bases = [ ctx_base for ctx_base in range( batch_base, batch_base + batch_sz ) ]
+		# contexts in batch; each element is a tensor of word IDs in a given context
 		X = torch.stack(
 			[\
 				torch.tensor( opt.train[ ctx_base : ctx_base+n ] )\
@@ -135,22 +151,37 @@ def train( model, opt ):
 			]
 		)
 		# targets in batch corresponding to each context
-		y = torch.tensor(
+		y_true = torch.tensor(
 			[ opt.train( [ ctx_base+n ] ) for ctx_base in ctx_bases ]
 		)
 
 		if not opt.no_cuda:
-			X, y = X.cuda(), y.cuda()
+			X, y_true = X.cuda(), y_true.cuda()
 
 		opt.optimizer.zero_grad()
-		ln_probs = model( X ) 
+		pred_ln_probs = model( X ) 
 
-		loss = F.nll_loss( ln_probs, y )
+		loss = cross_entropy_loss( pred_ln_probs, y_true )
 		loss.backward()
 		opt.optimizer.step()
 
-		if i % 1024 == 0:
-			print( f"batch { i_batch }/{ batch_cnt }, loss { loss.item():f}" )
+		tok_cnt += toks_per_batch
+
+		if i % LOG_INTERVAL == 0:
+			delta_time = time.time() - starttime
+			wps = tok_cnt // delta_time
+			ppl = torch.exp( loss ).item() # synch
+			progress = ( i_batch / batch_cnt ) * 100
+
+			print(
+				f"batch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
+				f"loss { loss.item():4f}, "
+				f"perplexity { ppl:.2f}, "
+				f"speed: { wps } wps"
+			)
+
+			tok_cnt = 0
+			starttime = time.time()
 
 	if opt.savename:
 		torch.save( model.state_dict(), opt.savename + "/model_weights" )
@@ -201,7 +232,7 @@ def main():
 				text = text + opt.vocab[ encoded[ i ] ] + " "
 			opt.examples.append( encoded )
 
-			print( "origianl: %s" % line )
+			print( "original: %s" % line )
 			print( "encoded:  %s" % text )
 			print( " " )
 
