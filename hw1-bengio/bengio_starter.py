@@ -112,11 +112,35 @@ class bengio( torch.nn.Module ):
 		pred_ln_probs = torch.log_softmax( y_pred, dim=1 )
 		return pred_ln_probs
 
-def cross_entropy_loss( pred_ln_probs, y_true )
+def cross_entropy_loss( pred_ln_probs, y_true ):
 	sampl_cnt = pred_ln_probs.size( 0 )
 	true_ln_probs = pred_ln_probs[ torch.arange( sampl_cnt ), y_true ]
 	loss = -true_ln_probs.mean()
 	return loss
+
+def make_batch( corpus, wnd_sz, batch_base, batch_sz ):
+	#
+	# construct a batch of sample contexts and target words from `corpus`
+	# given context window size, batch base idx in corpus and batch size
+	#
+
+	# base indices of each context window in the corpus
+	ctx_bases = [ ctx_base for ctx_base in range( batch_base, batch_base + batch_sz ) ]
+
+	# contexts in batch; each element is a tensor of word IDs in a given context
+	X = torch.stack(
+		[\
+			torch.tensor( corpus[ ctx_base : ctx_base + wnd_sz ] )\
+			for ctx_base in ctx_bases\
+		]
+	)
+
+	# targets in batch corresponding to each context
+	y_true = torch.tensor(
+		[ corpus[ ctx_base + wnd_sz ] for ctx_base in ctx_bases ]
+	)
+	return X, y_true
+
 
 def train( model, opt ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
@@ -130,9 +154,9 @@ def train( model, opt ):
 	#
 	# inputs to your neural network can be either word embeddings or word look-up indices
 
-	n, batch_sz = opt.window, opt.batchsize
-	batch_cnt = ( len( opt.train ) - n ) // batch_sz
-	toks_per_batch = n * batch_sz # counting token overlaps between contexts
+	wnd_sz, batch_sz = opt.window, opt.batchsize
+	batch_cnt = ( len( opt.train ) - wnd_sz ) // batch_sz
+	toks_per_batch = wnd_sz * batch_sz # counting token overlaps between contexts
 
 	LOG_INTERVAL = 1024
 	starttime = time.time()
@@ -141,33 +165,23 @@ def train( model, opt ):
 	model.train()
 
 	for i_batch in range( batch_cnt ):
-		batch_base = i * batch_sz
-		ctx_bases = [ ctx_base for ctx_base in range( batch_base, batch_base + batch_sz ) ]
-		# contexts in batch; each element is a tensor of word IDs in a given context
-		X = torch.stack(
-			[\
-				torch.tensor( opt.train[ ctx_base : ctx_base+n ] )\
-				for ctx_base in ctx_bases\
-			]
-		)
-		# targets in batch corresponding to each context
-		y_true = torch.tensor(
-			[ opt.train( [ ctx_base+n ] ) for ctx_base in ctx_bases ]
-		)
 
+		batch_base = i_batch * batch_sz
+		X, y_true = make_batch( opt.train, wnd_sz, batch_base, batch_sz )
 		if not opt.no_cuda:
 			X, y_true = X.cuda(), y_true.cuda()
 
-		opt.optimizer.zero_grad()
 		pred_ln_probs = model( X ) 
-
+		# mean loss across batch
 		loss = cross_entropy_loss( pred_ln_probs, y_true )
+
+		opt.optimizer.zero_grad()
 		loss.backward()
 		opt.optimizer.step()
 
 		tok_cnt += toks_per_batch
 
-		if i % LOG_INTERVAL == 0:
+		if i_batch % LOG_INTERVAL == 0:
 			delta_time = time.time() - starttime
 			wps = tok_cnt // delta_time
 			ppl = torch.exp( loss ).item() # synch
@@ -190,7 +204,44 @@ def train( model, opt ):
 def test_model( model, opt, epoch ):
 	# functionality for this function is similar to train() except that you construct examples for the
 	# test or validation corpus; and you do not apply gradient descent.
-	return
+
+	n, batch_sz = opt.window, opt.batchsize
+	batch_cnt = ( len( opt.test ) - n ) // batch_sz
+
+	sampl_cnt = 0
+	correct_cnt = 0
+	total_loss = 0.0
+
+	model.eval()
+
+	with torch.no_grad():
+		for i_batch in range( batch_cnt ):
+
+			batch_base = i_batch * batch_sz
+			X, y_true = make_batch( opt.test, n, batch_base, batch_sz )
+			if not opt.no_cuda:
+				X, y_true = X.cuda(), y_true.cuda()
+
+			pred_ln_probs = model( X )
+
+			loss = cross_entropy_loss( pred_ln_probs, y_true )
+			total_loss += loss.item() * X.size( 0 )
+
+			y_pred = torch.argmax( pred_ln_probs, dim=1 )
+			correct_cnt += ( y_pred == y_true ).sum().item()
+
+			sampl_cnt += y_pred.size( 0 )
+
+	acc = ( correct_cnt / sampl_cnt ) * 100
+	mean_loss = total_loss / sampl_cnt
+	ppl = torch.exp( torch.tensor( mean_loss ) )
+
+	print(
+		f"Test results"
+		f"\taccurary: { acc:.3f}%"
+		f"\tmean loss: { mean_loss:.4f}"
+		f"\tperplexity: { ppl:.4f}"
+	)
 
 def main():
 
@@ -246,7 +297,7 @@ def main():
 		vocab_size=len( opt.vocab ), 
 		activation=torch.tanh
 	)
-	if opt.no_cuda == False:
+	if not opt.no_cuda:
 		model = model.cuda()
 	opt.optimizer = torch.optim.Adam( model.parameters(), lr=opt.lr, betas=( 0.9, 0.98 ), eps=1e-9 )
 
