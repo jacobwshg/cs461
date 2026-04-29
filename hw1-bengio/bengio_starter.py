@@ -115,6 +115,7 @@ class bengio( torch.nn.Module ):
 
 def cross_entropy_loss( pred_ln_probs, y_true ):
 	sampl_cnt = pred_ln_probs.size( 0 )
+	# select probs predicted for true targets
 	true_ln_probs = pred_ln_probs[ torch.arange( sampl_cnt ), y_true ]
 	loss = -true_ln_probs.mean()
 	return loss
@@ -156,7 +157,7 @@ def make_batch( corp_tsr, ctx_sz, batch_base, batch_sz ):
 	return X, y_true
 
 
-def train( model, opt, dev ):
+def train( model, opt ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
 	# your batches ( sub-corpora ). you can manually replicate the functionality of dataloader() to present 
 	# training examples to you model, you can manually calculate the probability assigned to the target 
@@ -168,7 +169,9 @@ def train( model, opt, dev ):
 	#
 	# inputs to your neural network can be either word embeddings or word look-up indices
 
-	train_tsr = torch.LongTensor( opt.train ).to( dev )
+	print( "===== train =====" )
+
+	train_tsr = torch.LongTensor( opt.train ).to( opt.dev )
 
 	ctx_sz, batch_sz = opt.window, opt.batchsize
 	batch_cnt = ( len( opt.train ) - ctx_sz ) // batch_sz
@@ -183,7 +186,7 @@ def train( model, opt, dev ):
 	epochs = max( 1, opt.epochs )
 	for e in range( epochs ):
 
-		print( "training epoch", e )
+		print( "training epoch", e+1 )
 		print( "starttime: ", dt.ctime( dt.now() ) )
 		
 		for i_batch in range( batch_cnt ):
@@ -208,14 +211,14 @@ def train( model, opt, dev ):
 
 				delta_time = time.time() - starttime
 				wps = tok_cnt / delta_time
-				ppl = torch.exp( loss ).item() # synch
+				ppl = torch.exp( loss ).item() # device synch
 				progress = ( i_batch / batch_cnt ) * 100
 
 				print(
 					f"{ hms }"
 					f"\tbatch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
 					f"\tloss { loss.item():4f}, "
-					f"\tperplexity { ppl:.2f}, "
+					f"\tperplexity { ppl:.3f}, "
 					f"\tspeed: { wps:.2f} wps"
 				)
 
@@ -227,15 +230,16 @@ def train( model, opt, dev ):
 		if opt.savename:
 			torch.save( model.state_dict(), opt.savename + "/model_weights" )
 
-
-def test_model( model, opt, dev ):
+def test_model( model, opt ):
 	# functionality for this function is similar to train() except that you construct examples for the
 	# test or validation corpus; and you do not apply gradient descent.
+
+	print( "===== test =====" )
 
 	ctx_sz, batch_sz = opt.window, opt.batchsize
 	batch_cnt = ( len( opt.test ) - ctx_sz ) // batch_sz
 
-	test_tsr = torch.LongTensor( opt.test ).to( dev )
+	test_tsr = torch.LongTensor( opt.test ).to( opt.dev )
 
 	sampl_cnt = 0
 	correct_cnt = 0
@@ -252,6 +256,7 @@ def test_model( model, opt, dev ):
 			pred_ln_probs = model( X )
 
 			loss = cross_entropy_loss( pred_ln_probs, y_true )
+			# undo mean
 			total_loss += loss.item() * X.size( 0 )
 
 			y_pred = torch.argmax( pred_ln_probs, dim=1 )
@@ -263,13 +268,49 @@ def test_model( model, opt, dev ):
 	mean_loss = total_loss / sampl_cnt
 	ppl = torch.exp( torch.tensor( mean_loss ) )
 
-
 	print(
 		f"\nTest results"
 		f"\n\taccuracy: { acc:.3f}%"
 		f"\n\tmean loss: { mean_loss:.4f}"
-		f"\n\tperplexity: { ppl:.4f}"
+		f"\n\tperplexity: { ppl:.3f}"
 	)
+
+def test_on_examples( model, opt ):
+
+	print()
+	print( "===== examples test =====" )
+
+	opt.examples = []
+	with open( "examples.txt", "rt" ) as f:
+		for linenum, line in enumerate( f ):
+			line = line.replace( "\n", "" )
+			#
+			# encode example line into word IDs, using ID of <unk>
+			# for unknown tokens
+			#
+			encoded = encode( line, opt.words )
+
+			enc_tsr = torch.tensor( encoded ).to( opt.dev )
+			X, y_true = make_batch( enc_tsr, opt.window, 0, 1 )
+			pred_ln_probs = model( X )
+			loss = cross_entropy_loss( pred_ln_probs, y_true )
+			ppl = torch.exp( loss ).item()
+
+			#
+			# remap encoded word IDs back to text for display
+			#
+			text = ""
+			for i in range( len( encoded ) ):
+				text = text + opt.vocab[ encoded[ i ] ] + " "
+			opt.examples.append( encoded )
+
+			print( "example ", linenum+1 )
+			print( "original: ", line )
+			print( "encoded:  ", text )
+			print( f"model perplexity: { ppl:.3f}" )
+			print()
+
+
 
 def main():
 
@@ -307,24 +348,10 @@ def main():
 	print( "d_model: ",   opt.d_model )
 	print( "batchsize: ", opt.batchsize )
 
-	dev = torch.device(
+	opt.dev = torch.device(
 		"cuda" if ( torch.cuda.is_available and not opt.no_cuda ) else "cpu"
 	)
-	print( "device: ", dev )
-
-	opt.examples = []
-	with open( "examples.txt", "rt" ) as f:
-		for line in f:
-			line = line.replace( "\n", "" )
-			encoded = encode( line, opt.words )
-			text = ""
-			for i in range( len( encoded ) ):
-				text = text + opt.vocab[ encoded[ i ] ] + " "
-			opt.examples.append( encoded )
-
-			print( "original: %s" % line )
-			print( "encoded:  %s" % text )
-			print( " " )
+	print( "device: ", opt.dev )
 
 	model = bengio( 
 		dim=opt.d_model, 
@@ -332,12 +359,13 @@ def main():
 		batchsize=opt.batchsize, 
 		vocab_size=len( opt.vocab ), 
 		activation=torch.tanh
-	).to( dev )
+	).to( opt.dev )
 
 	opt.optimizer = torch.optim.Adam( model.parameters(), lr=opt.lr, betas=( 0.9, 0.98 ), eps=1e-9 )
 
-	train( model, opt, dev )
-	test_model( model, opt, dev )
+	train( model, opt )
+	test_model( model, opt )
+	test_on_examples( model, opt )
 
 if __name__ == "__main__":
 	main()
