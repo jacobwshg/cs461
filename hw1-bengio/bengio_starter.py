@@ -156,6 +156,8 @@ def make_batch( corp_tsr, ctx_sz, batch_base, batch_sz ):
 
 	return X, y_true
 
+def format_hms( h, m, s ):
+	return f"{ h:02d}:{ m:02d}:{ s:02d}"
 
 def train( model, opt ):
 	# implement code to split you corpus into batches, use a sliding window to construct contexts over
@@ -177,7 +179,9 @@ def train( model, opt ):
 	batch_cnt = ( len( opt.train ) - ctx_sz ) // batch_sz
 	toks_per_batch = ctx_sz * batch_sz # counting token overlaps between contexts
 
-	starttime = time.time()
+	starttime = time.perf_counter()
+	start = dt.now()
+
 	tok_cnt = 0
 
 	model.train()
@@ -186,8 +190,9 @@ def train( model, opt ):
 	for e in range( epochs ):
 
 		print( "training epoch", e+1 )
-		print( "starttime: ", dt.ctime( dt.now() ) )
-		
+		ep_start = dt.now()
+		print( "start: ", dt.ctime( ep_start ) )
+
 		for i_batch in range( batch_cnt ):
 
 			batch_base = i_batch * batch_sz
@@ -206,15 +211,15 @@ def train( model, opt ):
 
 			if i_batch % opt.log_interval == 0:
 				now = dt.now()
-				hms = f"{ now.hour:02d}:{ now.minute:02d}:{ now.second:02d}"
+				h, m, s = now.hour, now.minute, now.second
 
-				delta_time = time.time() - starttime
+				delta_time = time.perf_counter() - starttime
 				wps = tok_cnt / delta_time
 				ppl = torch.exp( loss ).item() # device synch
 				progress = ( i_batch / batch_cnt ) * 100
 
 				print(
-					f"{ hms }"
+					format_hms( h, m, s ),
 					f"\tbatch { i_batch }/{ batch_cnt } ( { progress:.2f}% ), "
 					f"\tloss { loss.item():4f}, "
 					f"\tperplexity { ppl:.3f}, "
@@ -222,12 +227,16 @@ def train( model, opt ):
 				)
 
 				tok_cnt = 0
-				starttime = time.time()
+				starttime = time.perf_counter()
 
-		print( "endtime: ", dt.ctime( dt.now() ) )
+		ep_end = dt.now()
+		print( "end: ", dt.ctime( ep_end ), f"( epoch elapsed: { ( ep_end - ep_start ).seconds }s )" )
 
 		if opt.savename:
 			torch.save( model.state_dict(), opt.savename + "/model_weights" )
+
+	end = dt.now()
+	print( f"training total elapsed: { ( end - start ).seconds }s" )
 
 def test_model( model, opt ):
 	# functionality for this function is similar to train() except that you construct examples for the
