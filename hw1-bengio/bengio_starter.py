@@ -177,7 +177,6 @@ def train( model, opt ):
 	batch_cnt = ( len( opt.train ) - ctx_sz ) // batch_sz
 	toks_per_batch = ctx_sz * batch_sz # counting token overlaps between contexts
 
-	LOG_INTERVAL = 2048
 	starttime = time.time()
 	tok_cnt = 0
 
@@ -205,7 +204,7 @@ def train( model, opt ):
 
 			tok_cnt += toks_per_batch
 
-			if i_batch % LOG_INTERVAL == 0:
+			if i_batch % opt.log_interval == 0:
 				now = dt.now()
 				hms = f"{ now.hour:02d}:{ now.minute:02d}:{ now.second:02d}"
 
@@ -321,6 +320,8 @@ def main():
 	parser.add_argument( "-window",    type=int, default=5 )   
 	parser.add_argument( "-no_cuda",   action="store_true" )
 	parser.add_argument( "-epochs",    type=int, default=20 )
+	# log every how many batches during train()
+	parser.add_argument( "-log_interval", type=int, default=1024 )
 	parser.add_argument( "-d_model",   type=int, default=100 )
 	parser.add_argument( "-batchsize", type=int, default=512 )
 	parser.add_argument( "-lr",        type=float, default=5e-5 )
