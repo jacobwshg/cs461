@@ -54,7 +54,7 @@ class GPT2Attention(nn.Module):
 
 		return self.resid_dropout(self.c_proj(attn))
 
-
+# feed-forward
 class GPT2MLP(nn.Module):
 	def __init__(self, d_model, d_ff, resid_dropout=0.0):
 		super().__init__()
@@ -93,12 +93,24 @@ class TransformerGPT(nn.Module):
 
 		self.seqlen = seqlen
 
+		# word token embedding
 		self.wte = nn.Embedding(vocab_size, d_model)
+		# word position embedding
 		self.wpe = nn.Embedding(seqlen, d_model)
 
 		self.drop = nn.Dropout(dropout)
 
-		self.h = nn.ModuleList([GPT2Block(d_model, heads, d_ff, seqlen, attn_dropout=dropout, resid_dropout=dropout, layer_norm_epsilon=layer_norm_epsilon) for _ in range(n_layers)])
+		# N x GPT2Block
+		self.h = nn.ModuleList(
+			[
+				GPT2Block(
+					d_model, heads, 
+					d_ff, seqlen, 
+					attn_dropout=dropout, resid_dropout=dropout, 
+					layer_norm_epsilon=layer_norm_epsilon
+				) for _ in range(n_layers)
+			]
+		)
 
 		self.ln_f = nn.LayerNorm(d_model, eps=layer_norm_epsilon)
 
@@ -166,6 +178,7 @@ def test_model(model, indices, opt, epoch=0, device=None):
 	stride = aa * bb
 
 	with torch.no_grad():
+		# drag context window
 		for i in range(0, n_tokens - aa + 1, stride):
 			src = torch.zeros((bb, aa), dtype=torch.long)
 			trg = torch.zeros((bb, aa - 1, vocab_size), dtype=torch.float)
