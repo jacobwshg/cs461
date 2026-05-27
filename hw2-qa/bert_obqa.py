@@ -15,12 +15,12 @@ class OBQADataset( Dataset ):
 		self.tokenizer = tokenizer
 		self.max_len   = max_len
 		self.data      = self.load_data( path )
-	
+
 	def load_data( self, path ):
 
 		with open( path, "r" ) as f:
 			entries = f.readlines()
-		
+	
 		instances = []
 		for ent in entries:
 			fact, stem, ch_a, ch_b, ch_c, ch_d, ans = tuple( ent.split( "|" ) )
@@ -28,16 +28,18 @@ class OBQADataset( Dataset ):
 			choice_texts = [ ch_a, ch_b, ch_c, ch_d ]
 
 			ans_id = ord( ans[ 0 ] ) - ord( "A" )
-			
-			instances.append({
-				"fact": fact,
-				"stem": stem,
-				"choices": choice_texts,
-				"answer_id": ans_id
-			})
-		
+
+			instances.append(
+				{
+					"fact": fact,
+					"stem": stem,
+					"choices": choice_texts,
+					"answer_id": ans_id
+				}
+			)
+
 		return instances
-	
+
 	def __len__( self ):
 		return len( self.data )
 
@@ -48,7 +50,7 @@ class OBQADataset( Dataset ):
 		stem      = item[ "stem" ]
 		choices   = item[ "choices" ]
 		answer_id = item[ "answer_id" ]
-		
+
 		# prepare [CLS] <fact> <stem> <choice_text> [SEP]
 		inputseqs = [ f"{ fact } { stem } { ch }" for ch in choices ]
 
@@ -67,7 +69,7 @@ class OBQADataset( Dataset ):
 		input_ids = torch.stack( [ enc[ "input_ids" ].squeeze( 0 ) for enc in enc_inputs ] )
 
 		attn_msks = torch.stack( [ enc[ "attention_mask" ].squeeze( 0 ) for enc in enc_inputs ] )
-		
+
 		return \
 		{
 			"input_ids": input_ids,
@@ -87,34 +89,34 @@ class BertOBQA( nn.Module ):
 		# score choices
 		self.score_layer = nn.Linear( self.hidden_sz, 1 )
 
+	# forward a batch of samples through BERT
 	def forward( self, input_ids, attn_msk ):
 		"""
 		input_ids: ( batch_sz, num_choices, seq_len )
 		attn_msk: ( batch_sz, num_choices, seq_len )
 
 		returns:
-		logits: ( batch_sz, num_choices )
+		choice_scores ( logits ): ( batch_sz, num_choices )
 		"""
 		batch_sz, num_choices, seq_len = input_ids.shape
 
 		input_ids_flat = input_ids.view( -1, seq_len )
 		attn_msk_flat = attn_msk.view( -1, seq_len )
 
-		# forward through BERT
 		outputs = self.bertmodel(
 			input_ids=input_ids_flat,
 			attention_mask=attn_msk_flat
 		)
-		
-		# get CLS token embeddings (first token)
+
+		# get [CLS] token embeddings ( idx 0 in seq embeddings - first token )
 		cls_embeds = outputs.last_hidden_state[ :, 0, : ]  # ( batch_sz * num_choices, hidden_sz )
 		cls_embeds = self.dropout( cls_embeds )
-		
-		scores = self.score_layer( cls_embeds )  # ( batch_sz * num_choices, 1 )
-		# reshape back to ( batch_sz, num_choices )
-		scores = scores.view( batch_sz, num_choices )
 
-		return scores
+		choice_scores = self.score_layer( cls_embeds )  # ( batch_sz * num_choices, 1 )
+		# reshape back to ( batch_sz, num_choices )
+		choice_scores = choice_scores.view( batch_sz, num_choices )
+
+		return choice_scores
 
 def train_model(
 	model,
@@ -133,7 +135,7 @@ def train_model(
 	for epoch in range( num_epochs ):
 		print( f"\nepoch {epoch + 1}/{num_epochs}" )
 		
-		# Training phase
+		# training phase
 		model.train()
 		total_train_loss = 0
 		train_correct = 0
@@ -148,16 +150,16 @@ def train_model(
 			optimizer.zero_grad()
 
 			# forward
-			logits = model( input_ids, attn_msk )
+			choice_scores = model( input_ids, attn_msk )
 
-			loss = loss_fn( logits, labels )
+			loss = loss_fn( choice_scores, labels )
 
 			# backward
 			loss.backward()
 			optimizer.step()
 
 			# compute accuracy
-			preds = torch.argmax( logits, dim=1 )
+			preds = torch.argmax( choice_scores, dim=1 )
 			train_correct += ( preds == labels ).sum().item()
 			train_total += labels.size( 0 )
 			total_train_loss += loss.item()
@@ -190,19 +192,19 @@ def eval_model( model, data_loader, dev="cuda" ):
 	model.eval()
 	correct = 0
 	total = 0
-	
+
 	with torch.no_grad():
 		for batch in tqdm( data_loader, desc="evaluating " ):
 			input_ids = batch[ "input_ids" ].to( dev )
 			attn_msk = batch[ "attention_mask" ].to( dev )
 			labels = batch[ "labels" ].to( dev )
 
-			logits = model( input_ids, attn_msk )
-			preds = torch.argmax( logits, dim=1 )
+			choice_scores = model( input_ids, attn_msk )
+			preds = torch.argmax( choice_scores, dim=1 )
 
 			correct += ( preds == labels ).sum().item()
 			total += labels.size( 0 )
-	
+
 	acc = correct / total if total > 0 else 0
 	return acc
 
@@ -212,17 +214,17 @@ def predict( model, data_loader, dev="cuda" ):
 	"""
 	model.eval()
 	preds = []
-	
+
 	with torch.no_grad():
 		for batch in tqdm( data_loader, desc="predicting" ):
 			input_ids = batch[ "input_ids" ].to( dev )
 			attn_msk = batch[ "attention_mask" ].to( dev )
-			
-			logits = model( input_ids, attn_msk )
-			batch_preds = torch.argmax( logits, dim=1 )
-			
+
+			choice_scores = model( input_ids, attn_msk )
+			batch_preds = torch.argmax( choice_scores, dim=1 )
+
 			preds.extend( batch_preds.cpu().numpy() )
-	
+
 	return preds
 
 def main():
@@ -232,17 +234,17 @@ def main():
 	BATCH_SZ = 8	# Reduce if running out of memory
 	NUM_EPOCHS = 2
 	LEARNING_RATE = 2e-5
-	
+
 	dev = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
 	print( f"using device: { dev }" )
-	
+
 	# initialize
 	model = BertOBQA( MODEL_NAME )
 	tokenizer = BertTokenizer.from_pretrained( MODEL_NAME )
-	
+
 	# add special tokens if needed ( though we're using existing ones )
 	tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-	
+
 	train_dataset = OBQADataset(
 		path="obqa/obqa.train.txt",
 		tokenizer=tokenizer, 
@@ -258,12 +260,12 @@ def main():
 		tokenizer=tokenizer, 
 		max_len=MAX_LEN
 	)
-	
+
 	# Create data loaders
 	train_loader = DataLoader( train_dataset, batch_size=BATCH_SZ, shuffle=True )
 	val_loader   = DataLoader( val_dataset, batch_size=BATCH_SZ, shuffle=False )
 	test_loader  = DataLoader( test_dataset, batch_size=BATCH_SZ, shuffle=False )
-	
+
 	# Train the model
 	print( "starting training..." )
 	train_model(
@@ -272,7 +274,7 @@ def main():
 		num_epochs=NUM_EPOCHS, lr=LEARNING_RATE,
 		dev=dev
 	)
-	
+
 	# Load best model for final evaluation
 	model.load_state_dict( torch.load( "best_openbookqa_model.pth" ) )
 
@@ -290,7 +292,7 @@ def main():
 	# Save results
 	with open( "predictions.json", "w" ) as f:
 		json.dump( preds_alpha, f )
-	
+
 	print( "train and eval complete" )
 
 if __name__ == "__main__":
