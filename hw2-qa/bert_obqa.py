@@ -120,7 +120,7 @@ class BertOBQA( nn.Module ):
 
 def train_model(
 	model,
-	train_loader, val_loader,
+	train_loader, valid_loader,
 	num_epochs=2, lr=2e-5, 
 	dev="cuda"
 ):
@@ -175,13 +175,13 @@ def train_model(
 		train_acc = train_correct / train_total
 		
 		# validation
-		valid_acc = eval_model( model, val_loader, dev )
+		valid_acc = eval_model( model, valid_loader, dev )
 
 		print( f"train loss: { avg_train_loss:.4f}, train acc: { train_acc:.4f}, valid acc: { valid_acc:.4f}"  )
 		
 		# save best model
 		if valid_acc > best_valid_acc:
-			best_val_acc = valid_acc
+			best_valid_acc = valid_acc
 			torch.save( model.state_dict(), "best_openbookqa_model.pth" )
 			print( f"new best model saved with valid acc: { valid_acc:.4f}" )
 
@@ -231,8 +231,8 @@ def main():
 
 	MODEL_NAME = "bert-base-uncased"
 	MAX_LEN    = 256  # Adjust based on your computational resources
-	BATCH_SZ = 8	# Reduce if running out of memory
-	NUM_EPOCHS = 2
+	BATCH_SZ   = 8	# Reduce if running out of memory
+	NUM_EPOCHS = 1
 	LEARNING_RATE = 2e-5
 
 	dev = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
@@ -245,32 +245,32 @@ def main():
 	# add special tokens if needed ( though we're using existing ones )
 	tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-	train_dataset = OBQADataset(
+	train_set = OBQADataset(
 		path="obqa/obqa.train.txt",
 		tokenizer=tokenizer, 
 		max_len=MAX_LEN
 	)
-	val_dataset = OBQADataset(
+	valid_set = OBQADataset(
 		path="obqa/obqa.valid.txt",
 		tokenizer=tokenizer, 
 		max_len=MAX_LEN
 	)
-	test_dataset = OBQADataset(
+	test_set = OBQADataset(
 		path="obqa/obqa.test.txt",
 		tokenizer=tokenizer, 
 		max_len=MAX_LEN
 	)
 
 	# Create data loaders
-	train_loader = DataLoader( train_dataset, batch_size=BATCH_SZ, shuffle=True )
-	val_loader   = DataLoader( val_dataset, batch_size=BATCH_SZ, shuffle=False )
-	test_loader  = DataLoader( test_dataset, batch_size=BATCH_SZ, shuffle=False )
+	train_loader = DataLoader( train_set, batch_size=BATCH_SZ, shuffle=True )
+	valid_loader   = DataLoader( valid_set, batch_size=BATCH_SZ, shuffle=False )
+	test_loader  = DataLoader( test_set, batch_size=BATCH_SZ, shuffle=False )
 
 	# Train the model
 	print( "starting training..." )
 	train_model(
 		model=model,
-		train_loader=train_loader, val_loader=val_loader,
+		train_loader=train_loader, valid_loader=valid_loader,
 		num_epochs=NUM_EPOCHS, lr=LEARNING_RATE,
 		dev=dev
 	)
@@ -279,11 +279,11 @@ def main():
 	model.load_state_dict( torch.load( "best_openbookqa_model.pth" ) )
 
 	# eval on validation set
-	valid_acc = eval_model( model, val_loader, dev )
-	print( f"final validation accuracy: { val_accuracy:.4f}" )
+	valid_acc = eval_model( model, valid_loader, dev )
+	print( f"final validation accuracy: { valid_acc:.4f}" )
 
 	# predict on test set
-	test_preds = predict( model, test_loader, device )
+	test_preds = predict( model, test_loader, dev )
 	#print( f"test predictions shape: { len( test_predictions ) }" )
 
 	# remap answer_ids back to letters
