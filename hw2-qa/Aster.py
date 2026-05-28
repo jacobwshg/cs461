@@ -168,7 +168,7 @@ def test_model( model, indices, opt, epoch=0, device=None ):
 	if device is None:
 		device = next( model.parameters() ).device
 
-	aa = opt.eval_seqlen
+	aa = opt.seqlen
 	bb = opt.eval_batchsize
 	total_loss = 0.0
 	count = 0
@@ -385,9 +385,11 @@ def train_qa( model, dataloader, optimizer, dev ):
 		total += batch_sz
 		correct += ( preds == label_idxs ).sum().item()
 
-	return total_loss / total, correct / total
+	train_loss = total_loss / total
+	train_acc  = correct / total
+	return train_loss, train_acc
 
-def eval_qa( model, dataloader, loss_fn, dev ):
+def eval_qa( model, dataloader, dev ):
 
 	model.eval()
 
@@ -403,7 +405,8 @@ def eval_qa( model, dataloader, loss_fn, dev ):
 		total += batch_sz 
 		correct += ( preds == batch[ "label_idx" ] ).sum().item()
 
-	return correct / total
+	eval_acc = correct / total
+	return eval_acc
 
 def main():
 	parser = argparse.ArgumentParser()
@@ -411,15 +414,19 @@ def main():
 	parser.add_argument( "-loadname", type=str, default="" )
 	parser.add_argument( "-valid_file", type=str, default="" )
 	parser.add_argument( "-tokenizer_dir", type=str, default="" )
+
 	parser.add_argument( "-d_model", type=int, default=1024 )
 	parser.add_argument( "-d_ff", type=int, default=4096 )
 	parser.add_argument( "-n_layers", type=int, default=16 )
 	parser.add_argument( "-heads", type=int, default=16 )
 	parser.add_argument( "-seqlen", type=int, default=1024 )
-	parser.add_argument( "-eval_seqlen", type=int, default=None )
-	parser.add_argument( "-eval_batchsize", type=int, default=1 )
+	parser.add_argument( "-batchsize", type=int, default=1 )
+
 	parser.add_argument( "-dropout", type=float, default=0.0 )
 	parser.add_argument( "-epsilon", type=float, default=1e-5 )
+
+	parser.add_argument( "-lr", type=float, default=2e-5 )
+
 	parser.add_argument( "-no_cuda", action="store_true" )
 
 	opt = parser.parse_args()
@@ -428,13 +435,17 @@ def main():
 	obqa_test = read_obqa( "obqa/obqa.test.txt" )
 	obqa_valid = read_obqa( "obqa/obqa.valid.txt" )
 
-	if opt.eval_seqlen is None:
-		opt.eval_seqlen = opt.seqlen
-
-	device = torch.device( "cuda:0" if torch.cuda.is_available() and not opt.no_cuda else "cpu" )
+	device = torch.device(
+		"cuda:0" \
+		if torch.cuda.is_available() and not opt.no_cuda \
+		else "cpu"
+	)
 
 	tokenizer = GPT2TokenizerFast.from_pretrained( opt.tokenizer_dir )
 	tokenizer.model_max_length = 10**9
+
+	if tokenizer.pad_token is None:
+		tokenizer.pad_token = tokenizer.eos_token
 
 	state_dict = load_model_best_state_dict( opt.loadname )
 	vocab_size = int( state_dict[ "wte.weight" ].shape[ 0 ] )
@@ -447,10 +458,38 @@ def main():
 	)
 	model.load_state_dict( state_dict, strict=True )
 	model.to( device )
-	model.eval()
 
-	indices = my_tokenizer( opt.valid_file,tokenizer,1000000 )
-	ppl = test_model( model=model, indices=indices, opt=opt, epoch=0, device=device )
+	#model.eval()
+
+	train_raw = read_obqa( "obqa/obqa.train.txt" )
+	valid_raw = read_obqa( "obqa/obqa.valid.txt" )
+	train_set = OBQADataset( train_raw, tokenizer, max_len=opt.seqlen )
+	valid_set = OBQADataset( valid_raw, tokenizer, max_len=opt.seqlen )
+
+	train_ldr = DataLoader( train_set, batch_size=opt.batchsize, shuffle=True )
+	valid_ldr = DataLoader( valid_set, batch_size=opt.batchsize, shuffle=False )
+
+	optimizer = torch.optim.AdamW( model.parameters(), lr=opt.lr )
+
+	best_valid_acc = 0.0	
+
+	print( "training start" )
+	for epoch in range( opt.epochs ):
+		train_loss, train_acc = train_qa( model, train_ldr, optimizer, device )
+        valid_acc = eval_qa( model, valid_ldr, device )
+        print(
+			f"epoch { epoch+1 } | \
+			train loss: { train_loss:.4f} | \
+			train acc: { train_acc*100:.2f}% | \
+`			valid acc: { valid_acc*100:.2f}%"
+		)
+		if valid_acc > best_valid_acc:
+			best_valid_acc = valid_acc
+			torch.save( { "model_state_dict": model.state_dict() }, "aster_obqa.pt" )
+			print( "new best model saved" )
+
+	#indices = my_tokenizer( opt.valid_file,tokenizer,1000000 )
+	#ppl = test_model( model=model, indices=indices, opt=opt, epoch=0, device=device )
 
 if __name__ == "__main__":
 	main()

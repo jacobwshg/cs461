@@ -8,7 +8,7 @@ python3 Aster.py \
 	-n_layers 16 \
 	-heads 16 \
 	-seqlen 1024 \
-	-eval_batchsize 8 \
+	-batchsize 8 \
 	-valid_file saved/mixture_valid.txt \
 	-tokenizer saved/tokenizer 
 

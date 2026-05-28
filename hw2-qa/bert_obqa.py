@@ -276,7 +276,7 @@ def main():
 		dev=dev
 	)
 
-	# Load best model for final evaluation
+	# load best model for final evaluation
 	model.load_state_dict( torch.load( "best_openbookqa_model.pth" ) )
 
 	# eval on validation set
