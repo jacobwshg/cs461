@@ -249,8 +249,8 @@ def read_obqa( file_name ):
 			d[ "D" ] = tokens[ 5 ]
 			d[ "Answer" ] = tokens[ 6 ]   
 			data.append( d )
-	for i in range( 5 ):
-		print( i,data[ i ] )
+	#for i in range( 5 ):
+	#	print( i,data[ i ] )
 	print( "data: %d" % ( len( data ) ) )
 	return( data )
 
@@ -357,7 +357,7 @@ def forward_on_qa_batch( model, batch, dev="cuda" ):
 	# predict choice with lowest loss
 	preds = torch.argmin( choice_losses, dim=-1 )
 
-	return choice_losses, preds
+	return choice_losses, preds, batch_sz
 
 def train_qa( model, dataloader, optimizer, dev ):
 
@@ -371,13 +371,12 @@ def train_qa( model, dataloader, optimizer, dev ):
 	progbar = tqdm( dataloader, desc="training QA" )
 
 	for batch in progbar:
-		choice_losses, preds = forward_on_qa_batch(
+		choice_losses, preds, batch_sz = forward_on_qa_batch(
 			model, batch,
 			dev
 		)
 
 		label_idxs = batch[ "label_idx" ].to( dev )
-		batch_sz = label_idxs.shape[ 0 ]
 
 		# now lower loss = higher score
 		clsn_loss = nn.CrossEntropyLoss()(
@@ -413,13 +412,13 @@ def eval_qa( model, dataloader, dev ):
 
 	progbar = tqdm( dataloader, desc="evaluating QA" )
 	for batch in progbar:
-		_choice_losses, preds = forward_on_qa_batch(
+		_choice_losses, preds, batch_sz = forward_on_qa_batch(
 			model, batch,
 			dev
 		)
 
 		total += batch_sz 
-		correct += ( preds == batch[ "label_idx" ] ).sum().item()
+		correct += ( preds == batch[ "label_idx" ].to( dev ) ).sum().item()
 
 	eval_acc = correct / total
 	return eval_acc
