@@ -8,6 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2TokenizerFast
 
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
 class GPT2Attention(nn.Module):
 	def __init__(self, d_model, heads, max_seq_len, attn_dropout=0.0, resid_dropout=0.0):
 		super().__init__()
@@ -88,7 +91,12 @@ class GPT2Block(nn.Module):
 		return x
 
 class TransformerGPT(nn.Module):
-	def __init__(self, vocab_size, d_model, n_layers, heads, seqlen, d_ff, dropout=0.0, layer_norm_epsilon=1e-5):
+	def __init__(
+		self,
+		vocab_size, d_model, n_layers, heads, seqlen, d_ff,
+		dropout=0.0, layer_norm_epsilon=1e-5,
+		num_classes=4
+	):
 		super().__init__()
 
 		self.seqlen = seqlen
@@ -331,9 +339,8 @@ def eval_qa(model, dataloader, device):
 def main():
 	parser = argparse.ArgumentParser()
 
-	parser.add_argument("-loadname", type=str, default="")
-	parser.add_argument("-valid_file", type=str, default="")
-	parser.add_argument("-tokenizer_dir", type=str, default="")
+	parser.add_argument( "-loadname", type=str, default="../saved/model_best.pt" )
+	parser.add_argument( "-tokenizer_dir", type=str, default="../saved/tokenizer" )
 	parser.add_argument("-d_model", type=int, default=1024)
 	parser.add_argument("-d_ff", type=int, default=4096)
 	parser.add_argument("-n_layers", type=int, default=16)
