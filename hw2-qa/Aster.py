@@ -178,7 +178,7 @@ def test_model( model, indices, opt, epoch=0, device=None ):
 	stride = aa * bb
 
 	with torch.no_grad():
-		# drag context window
+		# drag ctx window
 		for i in range( 0, n_tokens - aa + 1, stride ):
 			src = torch.zeros( ( bb, aa ), dtype=torch.long )
 			trg = torch.zeros( ( bb, aa - 1, vocab_size ), dtype=torch.float )
@@ -249,6 +249,161 @@ def read_obqa( file_name ):
 		print( i,data[ i ] )
 	print( "data: %d" % ( len( data ) ) )
 	return( data )
+
+
+ID_PAD    = self.tokenizer.pad_token_id
+ID_IGNORE = -100
+
+class OBQADataset( Dataset ):
+	def __init__( self, data_list, tokenizer, max_len=1024 ):
+
+		self.data = data_list
+		self.tokenizer = tokenizer
+		self.max_len = max_len
+		self.choice_idx_tbl = { "A":0, "B":1, "C":2, "D":3 }
+
+	def __len__( self ):
+		return len( self.data )
+
+	def __getitem__( self, idx ):
+		item = self.data[ idx ]
+		fact = item[ "fact" ].strip()
+		stem = item[ "stem" ].strip()
+		label_idx = self.choice_idx_tbl[ item[ "Answer" ].strip() ]
+
+		choices = [ item[ "A" ], item[ "B" ], item[ "C" ], item[ "D" ] ]
+
+		input_ids = []
+		labels    = []
+		attn_msks = []
+
+		for choice in choices:
+
+			ctx_seq = f"Fact: { fact } Question: { stem } Answer:"
+			trg_seq = f" { choice.strip() } "
+
+			ctx_ids = self.tokenizer.encode( ctx_seq, add_special_tokens=False )
+			trg_ids = self.tokenizer.encode( trg_seq, add_special_tokens=False )
+			ctx_len = len( ctx_ids )
+			input_len = ctx_len + len( trg_ids )
+
+			choice_input_ids = [ ID_PAD ] * self.max_len
+			choice_labels = [ ID_IGNORE ] * self.max_len
+			choice_attnmsk = [ 0 ] * self.max_len
+
+			for i in range( self.max_len ):
+
+				if i < ctx_len:
+					# ID is in ctx
+					choice_input_ids[ i ] = ctx_ids[ i ]
+
+				elif i < input_len:
+					# ID is in target
+					choice_input_ids[ i ] = trg_ids[ i-ctx_len ]
+					# only calculate loss on target tokens; mask out ctx tokens
+					choice_labels[ i ] = choice_input_ids[ i ]
+
+				if i < input_len:
+					choice_attnmsk[ i ] = 1
+
+
+			input_ids.append( choice_input_ids )
+			labels   .append( choice_labels )
+			attn_msks.append( choice_attnmsk )
+
+		return \
+		{
+			# ( 4, max_len )
+			"input_ids"     : torch.tensor( input_ids, dtype=torch.long ),
+			"attention_mask": torch.tensor( attn_msks, dtype=torch.long ),
+			"labels"        : torch.tensor( labels,    dtype=torch.long ),
+			"label_idx"     : torch.tensor( label_idx,  dtype=torch.long )
+		}
+
+def forward_on_qa_batch( model, batch, loss_fn, dev="cuda" ):
+	input_ids  = batch[ "input_ids" ].to( dev )
+	attn_msk   = batch[ "attention_mask" ].to( dev )
+	labels     = batch[ "labels" ].to( dev )
+	label_idxs = batch[ "label_idx" ].to( dev ) # ( batch_size )
+
+	batch_sz, num_choices, seq_len = input_ids.shape()
+
+	input_ids_flat = input_ids.view( -1, seq_len )
+	attn_msk_flat  = attn_msk .view( -1, seq_len )
+	labels_flat    = labels   .view( -1, seq_len )
+
+	_x, y = model( input_ids_flat, attention_mask=attn_msk_flat )
+
+	y_shift = y[ ..., :-1, : ].contiguous()
+	labels_shift = labels_flat[ ..., 1: ].contiguous()
+
+	loss_flat = loss_fn(
+		y_shift.view( -1, y_shift.size( -1 ) ),
+		labels_shift.view( -1 )
+	)
+	loss_flat = loss_flat.view( batch_sz * num_choices, seq_len-1 )
+
+	valid_tok_cnts = ( labels_shift != ID_IGNORE ).sum( dim=-1 ).float()
+	valid_tok_cnts = torch.clamp( valid_tok_cnts, min=1.0 )
+
+	seq_losses = loss_flat.sum( dim=-1 ) / valid_tok_cnts
+	choice_losses = seq_losses.view( batch_sz, num_choices )
+
+	# predict choice with lowest loss
+	preds = torch.argmin( choice_losses, dim=-1 )
+
+	return choice_losses, preds
+
+def train_qa( model, dataloader, optimizer, dev ):
+
+	model.train()
+
+	total_loss = 0
+	total, correct = 0, 0
+
+	for batch in dataloader:
+
+		choice_losses, preds = forward_on_qa_batch(
+			model, batch,
+			nn.CrossEntropyLoss(),
+			dev
+		)
+
+		label_idxs = batch[ "label_idx" ].to( dev )
+
+		# now lower loss = higher score
+		clsn_loss = nn.CrossEntropyLoss(
+			-choice_losses,
+			label_idxs
+		)
+
+		optimizer.zero_grad()
+		clsn_loss.backward()
+		optimizer.step()
+
+		total_loss += clsn_loss.item() * batch_sz
+		total += batch_sz
+		correct += ( preds == label_idxs ).sum().item()
+
+	return total_loss / total, correct / total
+
+def eval_qa( model, dataloader, loss_fn, dev ):
+
+	model.eval()
+
+	correct, total = 0, 0
+
+	for batch in dataloader:
+		_choice_losses, preds = forward_on_qa_batch(
+			model, batch,
+			nn.CrossEntropyLoss(),
+			dev
+		)
+
+		total += batch_sz 
+		correct += ( preds == batch[ "label_idx" ] ).sum().item()
+
+	return correct / total
 
 def main():
 	parser = argparse.ArgumentParser()
