@@ -73,8 +73,8 @@ class OBQADataset( Dataset ):
 		return \
 		{
 			"input_ids": input_ids,
-			"attention_mask": attn_msks,
-			"labels": torch.tensor( answer_id, dtype=torch.long )
+			"attn_msk": attn_msks,
+			"true_labels": torch.tensor( answer_id, dtype=torch.long )
 		}
 
 class BertOBQA( nn.Module ):
@@ -143,16 +143,16 @@ def train_model(
 
 		progbar = tqdm( train_loader, desc=f"training epoch {epoch+1}" )
 		for batch in progbar:
-			input_ids = batch[ "input_ids" ].to( dev )
-			attn_msk = batch[ "attention_mask" ].to( dev )
-			labels = batch[ "labels" ].to( dev )
+			input_ids    = batch[ "input_ids" ].to( dev )
+			attn_msk     = batch[ "attn_msk" ].to( dev )
+			true_labels  = batch[ "true_labels" ].to( dev )
 
 			optimizer.zero_grad()
 
 			# forward
 			choice_scores = model( input_ids, attn_msk )
 
-			loss = loss_fn( choice_scores, labels )
+			loss = loss_fn( choice_scores, true_labels )
 
 			# backward
 			loss.backward()
@@ -160,8 +160,8 @@ def train_model(
 
 			# compute accuracy
 			preds = torch.argmax( choice_scores, dim=1 )
-			train_correct += ( preds == labels ).sum().item()
-			train_total += labels.size( 0 )
+			train_correct += ( preds == true_labels ).sum().item()
+			train_total += true_labels.size( 0 )
 			total_train_loss += loss.item()
 
 			progbar.set_postfix( 
@@ -196,14 +196,14 @@ def eval_model( model, data_loader, dev="cuda" ):
 	with torch.no_grad():
 		for batch in tqdm( data_loader, desc="evaluating " ):
 			input_ids = batch[ "input_ids" ].to( dev )
-			attn_msk = batch[ "attention_mask" ].to( dev )
-			labels = batch[ "labels" ].to( dev )
+			attn_msk = batch[ "attn_msk" ].to( dev )
+			true_labels = batch[ "true_labels" ].to( dev )
 
 			choice_scores = model( input_ids, attn_msk )
 			preds = torch.argmax( choice_scores, dim=1 )
 
-			correct += ( preds == labels ).sum().item()
-			total += labels.size( 0 )
+			correct += ( preds == true_labels ).sum().item()
+			total += true_labels.size( 0 )
 
 	acc = correct / total if total > 0 else 0
 	return acc
@@ -218,7 +218,7 @@ def predict( model, data_loader, dev="cuda" ):
 	with torch.no_grad():
 		for batch in tqdm( data_loader, desc="predicting" ):
 			input_ids = batch[ "input_ids" ].to( dev )
-			attn_msk = batch[ "attention_mask" ].to( dev )
+			attn_msk = batch[ "attn_msk" ].to( dev )
 
 			choice_scores = model( input_ids, attn_msk )
 			batch_preds = torch.argmax( choice_scores, dim=1 )
@@ -245,6 +245,7 @@ def main():
 	# add special tokens if needed ( though we're using existing ones )
 	tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
+	# instantiate datasets
 	train_set = OBQADataset(
 		path="obqa/obqa.train.txt",
 		tokenizer=tokenizer, 
@@ -261,12 +262,12 @@ def main():
 		max_len=MAX_LEN
 	)
 
-	# Create data loaders
+	# create data loaders
 	train_loader = DataLoader( train_set, batch_size=BATCH_SZ, shuffle=True )
-	valid_loader   = DataLoader( valid_set, batch_size=BATCH_SZ, shuffle=False )
+	valid_loader = DataLoader( valid_set, batch_size=BATCH_SZ, shuffle=False )
 	test_loader  = DataLoader( test_set, batch_size=BATCH_SZ, shuffle=False )
 
-	# Train the model
+	# train 
 	print( "starting training..." )
 	train_model(
 		model=model,
