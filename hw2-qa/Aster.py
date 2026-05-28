@@ -10,6 +10,8 @@ from transformers import GPT2TokenizerFast
 
 from torch.utils.data import Dataset, DataLoader
 
+from tqdm import tqdm
+
 class GPT2Attention( nn.Module ):
 	def __init__( self, d_model, heads, max_seq_len, attn_dropout=0.0, resid_dropout=0.0 ):
 		super().__init__()
@@ -110,9 +112,9 @@ class TransformerGPT( nn.Module ):
 					d_ff, seqlen, 
 					attn_dropout=dropout, resid_dropout=dropout, 
 					layer_norm_epsilon=layer_norm_epsilon
-				 ) for _ in range( n_layers )
-			 ]
-		 )
+				) for _ in range( n_layers )
+			]
+		)
 
 		self.ln_f = nn.LayerNorm( d_model, eps=layer_norm_epsilon )
 
@@ -322,13 +324,13 @@ class OBQADataset( Dataset ):
 			"label_idx"	 : torch.tensor( label_idx,  dtype=torch.long )
 		}
 
-def forward_on_qa_batch( model, batch, loss_fn, dev="cuda" ):
+def forward_on_qa_batch( model, batch, dev="cuda" ):
 	input_ids = batch[ "input_ids" ].to( dev )
 	attn_msk  = batch[ "attention_mask" ].to( dev )
 	labels	  = batch[ "labels" ].to( dev )
 	label_idxs = batch[ "label_idx" ].to( dev ) # ( batch_size )
 
-	batch_sz, num_choices, seq_len = input_ids.shape()
+	batch_sz, num_choices, seq_len = input_ids.shape
 
 	input_ids_flat = input_ids.view( -1, seq_len )
 	attn_msk_flat = attn_msk .view( -1, seq_len )
@@ -336,16 +338,17 @@ def forward_on_qa_batch( model, batch, loss_fn, dev="cuda" ):
 
 	_x, y = model( input_ids_flat, attention_mask=attn_msk_flat )
 
-	y_shift = y[ ..., :-1, : ].contiguous()
-	labels_shift = labels_flat[ ..., 1: ].contiguous()
+	cur_logits = y[ ..., :-1, : ].contiguous()
+	nxt_labels = labels_flat[ ..., 1: ].contiguous()
 
-	loss_flat = loss_fn(
-		y_shift.view( -1, y_shift.size( -1 ) ),
-		labels_shift.view( -1 )
+	loss_fn = nn.CrossEntropyLoss( reduction="none" )
+	loss = loss_fn(
+		cur_logits.view( -1, cur_logits.size( -1 ) ),
+		nxt_labels.view( -1 )
 	)
-	loss_flat = loss_flat.view( batch_sz * num_choices, seq_len-1 )
+	loss_flat = loss.view( batch_sz * num_choices, seq_len-1 )
 
-	valid_tok_cnts = ( labels_shift != ID_IGNORE ).sum( dim=-1 ).float()
+	valid_tok_cnts = ( nxt_labels != ID_IGNORE ).sum( dim=-1 ).float()
 	valid_tok_cnts = torch.clamp( valid_tok_cnts, min=1.0 )
 
 	seq_losses = loss_flat.sum( dim=-1 ) / valid_tok_cnts
@@ -360,21 +363,24 @@ def train_qa( model, dataloader, optimizer, dev ):
 
 	model.train()
 
+	train_loss, train_acc = 0.0, 0.0
+
 	total_loss = 0
 	total, correct = 0, 0
 
-	for batch in dataloader:
+	progbar = tqdm( dataloader, desc="training QA" )
 
+	for batch in progbar:
 		choice_losses, preds = forward_on_qa_batch(
 			model, batch,
-			nn.CrossEntropyLoss(),
 			dev
 		)
 
 		label_idxs = batch[ "label_idx" ].to( dev )
+		batch_sz = label_idxs.shape[ 0 ]
 
 		# now lower loss = higher score
-		clsn_loss = nn.CrossEntropyLoss(
+		clsn_loss = nn.CrossEntropyLoss()(
 			-choice_losses,
 			label_idxs
 		)
@@ -387,20 +393,28 @@ def train_qa( model, dataloader, optimizer, dev ):
 		total += batch_sz
 		correct += ( preds == label_idxs ).sum().item()
 
-	train_loss = total_loss / total
-	train_acc  = correct / total
+		train_loss = total_loss / total
+		train_acc  = correct / total
+		progbar.set_postfix(
+			{
+				"loss": train_loss,
+				"acc" : train_acc
+			}
+		)
+
 	return train_loss, train_acc
 
+@torch.no_grad()
 def eval_qa( model, dataloader, dev ):
 
 	model.eval()
 
 	correct, total = 0, 0
 
-	for batch in dataloader:
+	progbar = tqdm( dataloader, desc="evaluating QA" )
+	for batch in progbar:
 		_choice_losses, preds = forward_on_qa_batch(
 			model, batch,
-			nn.CrossEntropyLoss(),
 			dev
 		)
 
@@ -426,8 +440,9 @@ def main():
 
 	parser.add_argument( "-dropout", type=float, default=0.0 )
 	parser.add_argument( "-epsilon", type=float, default=1e-5 )
-
+	parser.add_argument( "-epochs", type=int, default=1 )
 	parser.add_argument( "-lr", type=float, default=2e-5 )
+
 
 	parser.add_argument( "-no_cuda", action="store_true" )
 
@@ -463,8 +478,8 @@ def main():
 
 	#model.eval()
 
-	train_raw = read_obqa( "obqa/obqa.train.txt" )
-	valid_raw = read_obqa( "obqa/obqa.valid.txt" )
+	train_raw = read_obqa( "obqa/obqa_train.txt" )
+	valid_raw = read_obqa( "obqa/obqa_valid.txt" )
 	train_set = OBQADataset( train_raw, tokenizer, max_len=opt.seqlen )
 	valid_set = OBQADataset( valid_raw, tokenizer, max_len=opt.seqlen )
 
