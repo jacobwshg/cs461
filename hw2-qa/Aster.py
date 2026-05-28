@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2TokenizerFast
 
+from torch.utils.data import Dataset, DataLoader
+
 class GPT2Attention( nn.Module ):
 	def __init__( self, d_model, heads, max_seq_len, attn_dropout=0.0, resid_dropout=0.0 ):
 		super().__init__()
@@ -250,8 +252,6 @@ def read_obqa( file_name ):
 	print( "data: %d" % ( len( data ) ) )
 	return( data )
 
-
-ID_PAD    = self.tokenizer.pad_token_id
 ID_IGNORE = -100
 
 class OBQADataset( Dataset ):
@@ -274,8 +274,10 @@ class OBQADataset( Dataset ):
 		choices = [ item[ "A" ], item[ "B" ], item[ "C" ], item[ "D" ] ]
 
 		input_ids = []
-		labels    = []
+		labels	= []
 		attn_msks = []
+
+		ID_PAD	= self.tokenizer.pad_token_id
 
 		for choice in choices:
 
@@ -314,23 +316,23 @@ class OBQADataset( Dataset ):
 		return \
 		{
 			# ( 4, max_len )
-			"input_ids"     : torch.tensor( input_ids, dtype=torch.long ),
+			"input_ids"	 : torch.tensor( input_ids, dtype=torch.long ),
 			"attention_mask": torch.tensor( attn_msks, dtype=torch.long ),
-			"labels"        : torch.tensor( labels,    dtype=torch.long ),
-			"label_idx"     : torch.tensor( label_idx,  dtype=torch.long )
+			"labels"		: torch.tensor( labels,	dtype=torch.long ),
+			"label_idx"	 : torch.tensor( label_idx,  dtype=torch.long )
 		}
 
 def forward_on_qa_batch( model, batch, loss_fn, dev="cuda" ):
-	input_ids  = batch[ "input_ids" ].to( dev )
-	attn_msk   = batch[ "attention_mask" ].to( dev )
-	labels     = batch[ "labels" ].to( dev )
+	input_ids = batch[ "input_ids" ].to( dev )
+	attn_msk  = batch[ "attention_mask" ].to( dev )
+	labels	  = batch[ "labels" ].to( dev )
 	label_idxs = batch[ "label_idx" ].to( dev ) # ( batch_size )
 
 	batch_sz, num_choices, seq_len = input_ids.shape()
 
 	input_ids_flat = input_ids.view( -1, seq_len )
-	attn_msk_flat  = attn_msk .view( -1, seq_len )
-	labels_flat    = labels   .view( -1, seq_len )
+	attn_msk_flat = attn_msk .view( -1, seq_len )
+	labels_flat	= labels   .view( -1, seq_len )
 
 	_x, y = model( input_ids_flat, attention_mask=attn_msk_flat )
 
@@ -411,9 +413,9 @@ def eval_qa( model, dataloader, dev ):
 def main():
 	parser = argparse.ArgumentParser()
 
-	parser.add_argument( "-loadname", type=str, default="" )
-	parser.add_argument( "-valid_file", type=str, default="" )
-	parser.add_argument( "-tokenizer_dir", type=str, default="" )
+	parser.add_argument( "-loadname", type=str, default="saved/model_best.pt" )
+	parser.add_argument( "-valid_file", type=str, default="saved/mixture_valid.txt" )
+	parser.add_argument( "-tokenizer_dir", type=str, default="saved/tokenizer" )
 
 	parser.add_argument( "-d_model", type=int, default=1024 )
 	parser.add_argument( "-d_ff", type=int, default=4096 )
@@ -476,8 +478,8 @@ def main():
 	print( "training start" )
 	for epoch in range( opt.epochs ):
 		train_loss, train_acc = train_qa( model, train_ldr, optimizer, device )
-        valid_acc = eval_qa( model, valid_ldr, device )
-        print(
+		valid_acc = eval_qa( model, valid_ldr, device )
+		print(
 			f"epoch { epoch+1 } | \
 			train loss: { train_loss:.4f} | \
 			train acc: { train_acc*100:.2f}% | \
