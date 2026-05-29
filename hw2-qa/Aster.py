@@ -122,7 +122,8 @@ class TransformerGPT( nn.Module ):
 		self.lm_head.weight = self.wte.weight
 
 	def forward( self, input_ids, attention_mask=None ):
-		bsz, seq_len = input_ids.size()
+		print( input_ids.shape )
+		bsz, seq_len = input_ids.shape
 
 		if seq_len > self.seqlen:
 			raise ValueError( f"sequence length { seq_len } exceeds model seqlen { self.seqlen }" )
@@ -173,7 +174,7 @@ def test_model( model, indices, opt, epoch=0, device=None ):
 		device = next( model.parameters() ).device
 
 	aa = opt.seqlen
-	bb = opt.eval_batchsize
+	bb = opt.batchsize
 	total_loss = 0.0
 	count = 0
 
@@ -397,7 +398,7 @@ class OBQAGenDataset( Dataset ):
 			"input_ids": torch.tensor( input_ids, dtype=torch.long ),
 			"attention_mask": torch.tensor( attn_msk, dtype=torch.long ),
 			"labels": torch.tensor( labels, dtype=torch.long ),
-			"label_idx": torch.tensor( ans_idx, dtype=torch.long )
+			"label_idx": torch.tensor( ans_idx, dtype=torch.long ),
 			# keep metadata to fetch alternatives during eval
 			"choices": [ item[ "A" ], item[ "B" ], item[ "C" ], item[ "D" ] ],
 		 }
@@ -577,7 +578,7 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 				top_prob = top_k_probs[ i ].item()
 				cands.append( ( seq + [ top_id ], score + top_prob ) )
 
-		# sort cands and keep top 'beam_width'
+		# sort cands and keep top `beam_width`
 		cands.sort( key=lambda x: x[ 1 ], reverse=True )
 		beams = cands[ :beam_width ]
 		
@@ -588,10 +589,16 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 	best_seq = beams[ 0 ][ 0 ]
 	gen_toks = best_seq[ actual_len: ]
 	gen_str = tokenizer.decode( gen_toks, skip_special_tokens=True ).strip()
+	print( "generated: ", "" .join( gen_str ) )
 	return gen_str
+
+from bert_score import BERTScorer
+scorer = BERTScorer( model_type="bert-base-uncased" )
 
 @torch.no_grad()
 def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
+
+
 	model.eval()
 	correct, total = 0, 0
 
@@ -610,7 +617,7 @@ def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
 		# replicate generation output to match candidate choices length
 		references = [ gen_str ] * len( choices )
 
-		_, _, f1 = bert_score( choices, references, lang="en", model_type="distilroberta-base", verbose=False )
+		_, _, f1 = scorer.score( choices, references )
 
 		# 4. Map to the choice maximizing F1 similarity metric
 		pred_idx = torch.argmax( f1 ).item()
@@ -688,7 +695,6 @@ def main():
 	model.load_state_dict( state_dict, strict=True )
 	model.to( device )
 
-	#model.eval()
 	if len( opt.mode ) == 0:
 		print( "no mode indicated - validating base model" )
 		model.eval()
@@ -722,7 +728,7 @@ def main():
 		print( f"--- zero-shot evaluation ---" )
 		
 		if opt.mode == "cls":
-			valid_acc = eval_qa( model, valid_ldr, device )
+			valid_acc = eval_mcqa( model, valid_ldr, device )
 		else:
 			valid_acc = eval_generative_bertscore( model, valid_ldr, tokenizer, device )
 			
@@ -734,7 +740,7 @@ def main():
 		best_valid_acc = 0.0	
 
 		for epoch in range( opt.epochs ):
-			if opt.mode == "classification":
+			if opt.mode == "cls":
 				train_loss, train_acc = train_mcqa( model, train_ldr, optimizer, device )
 				valid_acc = eval_mcqa( model, valid_ldr, device )
 				print( f"epoch { epoch+1 } | train loss: { train_loss:.4f} | train acc: { train_acc*100:.2f}% | valid acc: { valid_acc*100:.2f}%" )
