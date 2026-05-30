@@ -9,8 +9,10 @@ import torch.nn.functional as F
 from transformers import GPT2TokenizerFast
 
 from torch.utils.data import Dataset, DataLoader
-import torch.amp as amp
+import torch.cuda.amp as amp
 from tqdm import tqdm
+
+import random
 
 class GPT2Attention( nn.Module ):
 	def __init__( self, d_model, heads, max_seq_len, attn_dropout=0.0, resid_dropout=0.0 ):
@@ -113,7 +115,7 @@ class TransformerGPT( nn.Module ):
 					attn_dropout=dropout, resid_dropout=dropout, 
 					layer_norm_epsilon=layer_norm_epsilon
 				) for _ in range( n_layers )
-			 ]
+			]
 		)
 
 		self.ln_f = nn.LayerNorm( d_model, eps=layer_norm_epsilon )
@@ -338,70 +340,7 @@ class OBQADataset( Dataset ):
 			"attention_mask": torch.tensor( attn_msks, dtype=torch.long ),
 			"labels"		: torch.tensor( labels,	dtype=torch.long ),
 			"label_idx"	 : torch.tensor( label_idx,  dtype=torch.long )
-		 }
-
-#
-# for generation
-#
-class OBQAGenDataset( Dataset ):
-	def __init__( self, data_list, tokenizer, max_len=128 ):
-		self.data = data_list
-		self.tokenizer = tokenizer
-		self.max_len = max_len
-
-	def __len__( self ):
-		return len( self.data )
-
-	def __getitem__( self, idx ):
-		item = self.data[ idx ]
-		fact = item[ "fact" ].strip()
-		stem = item[ "stem" ].strip()
-
-		ans_tag = item[ "Answer" ].strip()
-		ans_idx = CHOICE_TAG_IDX_TBL[ ans_tag ]
-		ans_str = item[ ans_tag ].strip()
-
-		ctx_seq = f"Fact: { fact } Question: { stem } Answer:"
-		trg_seq = f" { ans_str }"
-		ctx_ids = self.tokenizer.encode( ctx_seq, add_special_tokens=False )
-		trg_ids = self.tokenizer.encode( trg_seq, add_special_tokens=False )
-
-		# append eos to target, so model learns when to stop
-		trg_ids.append( self.tokenizer.eos_token_id )
-
-		ctx_len = len( ctx_ids )
-		input_len = ctx_len + len( trg_ids )
-
-		ID_PAD = self.tokenizer.pad_token_id
-
-		#
-		# only make sequence for context + correct target ( answer )
-		#
-
-		input_ids = [ ID_PAD ] * self.max_len
-		labels = [ ID_IGNORE ] * self.max_len
-		attn_msk = [ 0 ] * self.max_len
-
-		for i in range( min( self.max_len, input_len ) ):
-
-			attn_msk[ i ] = 1
-
-			if i < ctx_len:
-				input_ids[ i ] = ctx_ids[ i ]
-			else:
-				input_ids[ i ] = trg_ids[ i - ctx_len ]
-				# mask out context loss, only calculate on target
-				labels[ i ] = input_ids[ i ] 
-
-		return \
-		{ 
-			"input_ids": torch.tensor( input_ids, dtype=torch.long ),
-			"attention_mask": torch.tensor( attn_msk, dtype=torch.long ),
-			"labels": torch.tensor( labels, dtype=torch.long ),
-			"label_idx": torch.tensor( ans_idx, dtype=torch.long ),
-			# keep metadata to fetch alternatives during eval
-			"choices": [ item[ "A" ], item[ "B" ], item[ "C" ], item[ "D" ] ],
-		 }
+		}
 
 def forward_on_qa_batch( model, batch, dev="cuda" ):
 	input_ids = batch[ "input_ids" ].to( dev )
@@ -451,7 +390,7 @@ def train_mcqa( model, dataloader, optimizer, dev ):
 	total_loss = 0
 	total, correct = 0, 0
 
-	progbar = tqdm( dataloader, desc="training MCQA" )
+	progbar = tqdm( dataloader, desc="training decoder-only MCQA" )
 
 	for batch in progbar:
 
@@ -503,7 +442,7 @@ def eval_mcqa( model, dataloader, dev ):
 
 	correct, total = 0, 0
 
-	progbar = tqdm( dataloader, desc="evaluating MCQA" )
+	progbar = tqdm( dataloader, desc="evaluating decoder-only MCQA" )
 	for batch in progbar:
 		_choice_losses, preds, batch_sz = forward_on_qa_batch( 
 			model, batch,
@@ -516,164 +455,298 @@ def eval_mcqa( model, dataloader, dev ):
 	eval_acc = correct / total
 	return eval_acc
 
-def train_gen( model, dataloader, optimizer, dev ):
+class OBQAGenerationDataset( Dataset ):
+	def __init__( self, data_list, tokenizer, max_ctx_len=96, max_choice_len=32 ):
+		self.data = data_list
+		self.tokenizer = tokenizer
+		self.max_ctx_len = max_ctx_len
+		self.max_choice_len = max_choice_len
+
+	def __len__( self ):
+		return len( self.data )
+
+	def __getitem__( self, idx ):
+		item = self.data[ idx ]
+		fact = item[ "fact" ].strip()
+		stem = item[ "stem" ].strip()
+		label_idx = CHOICE_TAG_IDX_TBL[ item[ "Answer" ].strip() ]
+		choices = [ item[ "A" ], item[ "B" ], item[ "C" ], item[ "D" ] ]
+
+		# format and tokenize generation context prefix
+		ctx_seq = f"Fact: { fact } Question: { stem } Answer:"
+		ctx_ids = self.tokenizer.encode( ctx_seq, add_special_tokens=False )
+		ctx_ids = ctx_ids[ :self.max_ctx_len ]  # Truncate if it exceeds bounds
+
+		# tokenize and pad each choice target separately for BERTScore matrix operations
+		choice_ids_list = []
+		for choice in choices:
+			c_ids = self.tokenizer.encode( f" { choice.strip() } ", add_special_tokens=False )
+			c_ids = c_ids[ :self.max_choice_len ]
+			
+			# pad choices to fixed length so they can be stacked into a single tensor
+			padded_c_ids = c_ids + [ self.tokenizer.pad_token_id ] * ( self.max_choice_len - len( c_ids ) )
+			choice_ids_list.append( padded_c_ids )
+
+		return {
+			"context_input_ids": torch.tensor( ctx_ids, dtype=torch.long ),
+			"choice_ids": torch.tensor( choice_ids_list, dtype=torch.long ), # Shape: ( 4, max_choice_len )
+			"label_idx": torch.tensor( label_idx, dtype=torch.long )
+		}
+
+
+def beam_search( model, context_ids, beam_width=3, max_gen_len=32, temperature=1.0, pad_token_id=0 ):
+	"""
+	perform token-by-token beam search tracking cumulative log probs
+	"""
+	model.eval()
+	device = context_ids.device
+
+	# each beam: { "tokens": 1D tensor, "log_prob": float }
+	beams = [ { "tokens": context_ids.clone(), "log_prob": 0.0 } ]
+
+	for _ in range( max_gen_len ):
+		candidates = []
+
+		for beam in beams:
+			tokens = beam[ "tokens" ]
+			
+			# avoid predicting past the maximum allowed len
+			if tokens.size( 0 ) >= model.seqlen:
+				candidates.append( beam )
+				continue
+
+			# forward pass to retrieve logits for final token
+			with torch.no_grad():
+				_, logits = model( tokens.unsqueeze( 0 ) )
+				next_token_logits = logits[ 0, -1, : ] / max( temperature, 1e-5 )
+				log_probs = F.log_softmax( next_token_logits, dim=-1 )
+
+			# select top K candidates for expansion
+			topk_log_probs, topk_ids = torch.topk( log_probs, beam_width )
+
+			for i in range( beam_width ):
+				next_tok = topk_ids[ i ].unsqueeze( 0 )
+				cand_tokens = torch.cat( [ tokens, next_tok ], dim=0 )
+				cand_log_prob = beam[ "log_prob" ] + topk_log_probs[ i ].item()
+				candidates.append( { "tokens": cand_tokens, "log_prob": cand_log_prob } )
+
+		# sort candidates based on cumulative log prob and retain top beams
+		candidates = sorted( candidates, key=lambda x: x[ "log_prob" ], reverse=True )
+		beams = candidates[ :beam_width ]
+
+		# TODO early stopping check if all top beams have finished
+
+	# return the top-scoring sequence, excluding context prefix
+	best_tokens = beams[ 0 ][ "tokens" ]
+	return best_tokens[ len( context_ids ): ]
+
+def compute_bertscore_wte( model, gen_ids, ref_ids ):
+	"""
+	compute static embedding-based BERTScore metric
+	"""
+	if len( gen_ids ) == 0 or len( ref_ids ) == 0:
+		return torch.tensor( 0.0, device=gen_ids.device )
+
+	# extract static token embeddings from the model
+	gen_emb = model.wte( gen_ids ).float()  # Shape: [ M, d_model ]
+	ref_emb = model.wte( ref_ids ).float()  # Shape: [ N, d_model ]
+
+	# normalize token embeddings to calculate cosine similarity
+	gen_emb = gen_emb / ( gen_emb.norm( dim=-1, keepdim=True ) + 1e-8 )
+	ref_emb = ref_emb / ( ref_emb.norm( dim=-1, keepdim=True ) + 1e-8 )
+	# construct similarity matrix across token sequences
+	sim_matrix = torch.matmul( gen_emb, ref_emb.T )  # Shape: [ M, N ]
+
+	# calculate precision, recall, and f1 score
+	precision = sim_matrix.max( dim=1 )[ 0 ].mean()
+	recall = sim_matrix.max( dim=0 )[ 0 ].mean()
+
+	f1 = 2 * ( precision * recall ) / ( precision + recall + 1e-8 )
+	return f1
+
+def get_sequence_log_prob( model, context_ids, gen_ids ):
+	"""
+	re-run forward pass with gradient graph tracking 
+	to compute differentiable log probs of generated tokens
+	"""
+	full_seq = torch.cat( [ context_ids, gen_ids ], dim=0 )
+	_, logits = model( full_seq.unsqueeze( 0 ) )
+
+	# align logits with the targeted generation targets
+	ctx_len = len( context_ids )
+	gen_logits = logits[ 0, ctx_len - 1 : -1, : ]
+
+	log_probs = F.log_softmax( gen_logits, dim=-1 )
+	target_log_probs = log_probs.gather( 1, gen_ids.unsqueeze( 1 ) ).squeeze( 1 )
+
+	return target_log_probs.sum()
+
+
+def train_generative( model, dataloader, optimizer, dev, beam_width=3, temperature=0.7 ):
 	model.train()
-	total_loss, total_tok_cnt = 0.0, 0
-	progbar = tqdm( dataloader, desc="training generative QA" )
+	total_loss = 0.0
+	total_samples = 0
+	correct_mappings = 0
+
+	progbar = tqdm( dataloader, desc="training beam search" )
 
 	for batch in progbar:
 		optimizer.zero_grad()
-		
-		input_ids = batch[ "input_ids" ].to( dev )
-		attention_mask = batch[ "attention_mask" ].to( dev )
-		labels = batch[ "labels" ].to( dev )
 
-		with amp.autocast( 
-			device_type="cuda" if "cuda" in str( dev ) else "cpu",
-			dtype=torch.float16
-		):
-			_x, y = model( input_ids, attention_mask=attention_mask )
+		# squeeze out the batch dimension since batch_size=1
+		ctx_ids = batch[ "context_input_ids" ][ 0 ].to( dev ) # ( ctx_len )
+		choice_ids = batch[ "choice_ids" ][ 0 ].to( dev )     # ( 4, max_choice_len )
+		gt_label_idx = batch[ "label_idx" ][ 0 ].item()       # scalar
 
-			cur_logits = y[ ..., :-1, : ].contiguous()
-			nxt_labels = labels[ ..., 1: ].contiguous()
+		# generation pass
+		with torch.no_grad():
+			generated_tokens = beam_search( 
+				model=model, 
+				context_ids=ctx_ids, 
+				beam_width=beam_width, 
+				temperature=temperature
+			)
 
-			loss_fn = nn.CrossEntropyLoss( ignore_index=ID_IGNORE )
-			loss = loss_fn( cur_logits.view( -1, cur_logits.size( -1 ) ), nxt_labels.view( -1 ) )
+		if len( generated_tokens ) == 0:
+			continue
 
-		scaler.scale( loss ).backward()
-		scaler.step( optimizer )
-		scaler.update()
+		# compute BERTScore against target labels
+		scores = []
+		for i in range( 4 ):
+			# unpad choice tokens before passing to BERTScore calculation
+			valid_choice_tokens = choice_ids[ i ][ choice_ids[ i ] != dataloader.dataset.tokenizer.pad_token_id ]
+			score = compute_bertscore_wte( model, generated_tokens, valid_choice_tokens )
+			scores.append( score )
 
-		tok_cnt = ( nxt_labels != ID_IGNORE ).sum().item()
-		total_loss += loss.item() * tok_cnt
-		total_tok_cnt += tok_cnt
+		scores_tensor = torch.stack( scores )
+		predicted_choice_idx = torch.argmax( scores_tensor ).item()
 
-		progbar.set_postfix( { "loss": total_loss / max( 1, total_tok_cnt ) } )
+		total_samples += 1
+		if predicted_choice_idx == gt_label_idx:
+			correct_mappings += 1
 
-	return total_loss / max( 1, total_tok_cnt )
+		# formulate reward
+		gt_score = scores_tensor[ gt_label_idx ]
+		mask = torch.ones( 4, dtype=torch.bool, device=dev )
+		mask[ gt_label_idx ] = False
+		max_wrong_score = scores_tensor[ mask ].max()
 
-@torch.no_grad()
-def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, dev="cuda" ):
+		reward = gt_score - max_wrong_score
 
-	model.eval()
+		# minimize NLL scaled by reward performance
+		log_prob_seq = get_sequence_log_prob( model, ctx_ids, generated_tokens )
+		loss = -log_prob_seq * reward
 
-	# strip padding to get actual ctx length
-	actual_len = ( input_ids != tokenizer.pad_token_id ).sum().item()
-	beams = [ ( input_ids[ 0, :actual_len ].tolist(), 0.0 ) ] # ( token_list, log_prob )
+		loss.backward()
+		optimizer.step()
 
-	for l in range( max_beam_len ):
-		cands = []
+		total_loss += loss.item()
 
-		for seq, score in beams:
-			if seq[ -1 ] == tokenizer.eos_token_id:
-				# beam terminated
-				##print( "beam terminated at len ", l )
-				cands.append( ( seq, score ) )
-				continue
+		progbar.set_postfix( 
+			{ 
+				"loss": loss.item(),
+				"acc" : correct_mappings / total_samples
+			}
+		)
 
-			inp = torch.tensor( [ seq ], dtype=torch.long, device=dev )
-			_, logits = model( inp )
-			nxt_tok_logits = logits[ 0, -1, : ]
-			nxt_tok_log_probs = F.log_softmax( nxt_tok_logits, dim=-1 )
 
-			top_k_probs, top_k_ids = torch.topk( nxt_tok_log_probs, beam_width )
-			for i in range( beam_width ):
-				top_id = top_k_ids[ i ].item()
-				top_prob = top_k_probs[ i ].item()
-				cands.append( ( seq + [ top_id ], score + top_prob ) )
-
-		# sort cands and keep top `beam_width`
-		cands.sort( key=lambda x: x[ 1 ], reverse=True )
-		beams = cands[ :beam_width ]
-	
-		# break if all top beams hit eos
-		if all( seq[ -1 ] == tokenizer.eos_token_id for seq, _ in beams ):
-			##print( "all beams @ eos" )
-			break
-
-	best_seq = beams[ 0 ][ 0 ]
-	gen_toks = best_seq[ actual_len: ]
-	gen_str = tokenizer.decode( gen_toks, skip_special_tokens=False )
-	print( "generated: ", f"len { len( gen_toks ) } ", " ".join( gen_str ) )
-	return gen_str
-
-#from bert_score import BERTScorer
-#scorer = BERTScorer( model_type="bert-base-uncased" )
+	return total_loss / len( dataloader ), correct_mappings / len( dataloader )
 
 @torch.no_grad()
-def my_bertscore( 
-	model, tokenizer,
-	candidate, references,
-	dev="cuda"
+def eval_generative( 
+	model, 
+	data_list, 
+	tokenizer, 
+	dev, 
+	num_samples_to_print=3, 
+	beam_width=3, 
+	temperature=0.7
 ):
+	"""
+	evaluate the model using the beam search + BERTScore
+	randomly select and log details for a few samples
+	"""
 	model.eval()
+	
+	# randomly select sample indices to log
+	total_samples = len( data_list )
+	samples_to_log = set( random.sample( range( total_samples ), min( num_samples_to_print, total_samples ) ) )
 
-	wte = model.wte  # word token embeddings: ( vocab_size, d_model )
-	ID_PAD = tokenizer.pad_token_id
+	correct_mappings = 0
+	idx_to_tag = { 0: "A", 1: "B", 2: "C", 3: "D" }
 
-	# tokenize
-	cand_ids = tokenizer.encode( candidate, add_special_tokens=False )
-	ref_id_lists = [ tokenizer.encode( r, add_special_tokens=False ) for r in references ]
+	print( f"start evaluation over { total_samples } samples. \ndetailed logs will print for indices: { list( samples_to_log ) }\n" )
 
-	# Convert to tensors and pad
-	max_len = max( len( cand_ids ), max( len( r ) for r in ref_id_lists ) )
+	for idx in range( total_samples ):
+		# extract original raw data tokens and dictionary attributes
+		item = data_list[ idx ]
+		fact = item[ "fact" ].strip()
+		stem = item[ "stem" ].strip()
+		gt_tag = item[ "Answer" ].strip()
+		gt_label_idx = CHOICE_TAG_IDX_TBL[ gt_tag ]
+		choices = [ item[ "A" ].strip(), item[ "B" ].strip(), item[ "C" ].strip(), item[ "D" ].strip() ]
 
-	def pad_to_max( ids ):
-		return ids + [ ID_PAD ] * ( max_len - len( ids ) )
+		# format ctx prefix
+		ctx_seq = f"Fact: { fact } Question: { stem } Answer:"
+		ctx_ids = torch.tensor( tokenizer.encode( ctx_seq, add_special_tokens=False ), dtype=torch.long, device=dev )
 
-	cand_tsr = torch.tensor( [ pad_to_max( cand_ids ) ], device=dev )  # ( 1, L )
-	ref_tsrs = torch.tensor( [ pad_to_max( r ) for r in ref_id_lists ], device=dev )  # ( N, L )
+		# tokenize target choice sequences
+		choice_token_lists = [ 
+			torch.tensor( tokenizer.encode( f" { c } ", add_special_tokens=False ), dtype=torch.long, device=dev )
+			for c in choices
+		]
 
-	# create masks
-	cand_msk = ( cand_tsr != ID_PAD ).float()  # ( 1, L )
-	ref_msks = ( ref_tsrs != ID_PAD ).float()  # ( N, L )
-	# map IDs to embeddings
-	cand_embed = wte( cand_tsr )  # ( 1, L, d )
-	ref_embeds = wte( ref_tsrs )  # ( N, L, d )
+		# run beams search
+		generated_tokens = beam_search( 
+			model=model, 
+			context_ids=ctx_ids, 
+			beam_width=beam_width, 
+			temperature=temperature,
+			pad_token_id=tokenizer.pad_token_id
+		)
 
-	# mean pooling ( ignore pad )
-	cand_mean = ( cand_embed * cand_msk.unsqueeze( -1 ) ).sum( 1 ) \
-		/ cand_msk.sum( 1, keepdim=True ).clamp( min=1 )  # ( 1, d )
+		# compute BERTScores across all 4 choices
+		scores_tensor = torch.zeros( 4, device=dev )
+		if len( generated_tokens ) > 0:
+			scores = []
+			for choice_tokens in choice_token_lists:
+				score = compute_bertscore_wte( model, generated_tokens, choice_tokens )
+				scores.append( score )
+			scores_tensor = torch.stack( scores )
+			predicted_choice_idx = torch.argmax( scores_tensor ).item()
+		else:
+			# fallback guess if empty output
+			predicted_choice_idx = 0 
 
-	ref_means = ( ref_embeds * ref_msks.unsqueeze( -1 ) ).sum( 1 ) \
-		/ ref_msks.sum( 1, keepdim=True ).clamp( min=1 )  # ( N, d )
+		if predicted_choice_idx == gt_label_idx:
+			correct_mappings += 1
 
-	# cosine similarity
-	cand_norm = F.normalize( cand_mean, p=2, dim=-1 ) # ( 1, d )
-	ref_norms = F.normalize( ref_means, p=2, dim=-1 ) # ( N, d )
-	scores = torch.mm( cand_norm, ref_norms.t() ).squeeze( 0 ) # ( N, )
+		# log selected samples
+		if idx in samples_to_log:
+			# decode token sequence back to text
+			gen_text = tokenizer.decode( generated_tokens, skip_special_tokens=True ).strip()
+			pred_tag = idx_to_tag[ predicted_choice_idx ]
 
-	return scores # higher = more similar
+			##print( "=" * 70 )
+			print()
+			print( f" [ EVAL DIAGNOSTICS ] SAMPLE INDEX: { idx } " )
+			##print( "=" * 70 )
+			print()
+			print( f"Fact:		   { fact }" )
+			print( f"Stem/Question:  { stem }" )
+			print( "Choices text:" )
+			for i, c_text in enumerate( choices ):
+				print( f"  [ { idx_to_tag[ i ] } ] { c_text }" )
+			print( "-" * 70 )
+			print( f"Generated out:  { gen_text }" )
+			print( f"BERTScores:	 A: { scores_tensor[ 0 ]:.4f} | B: { scores_tensor[ 1 ]:.4f} | C: { scores_tensor[ 2 ]:.4f} | D: { scores_tensor[ 3 ]:.4f}" )
+			print( f"Predicted tag:  { pred_tag }" )
+			print( f"Reference tag:  { gt_tag } -> ( { 'CORRECT' if pred_tag == gt_tag else 'INCORRECT' } )" )
+			print( "=" * 70 + "\n" )
 
-@torch.no_grad()
-def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
-
-	model.eval()
-	correct, total = 0, 0
-
-	print( "evaluating via beam search generation + BERTScore mapping " )
-	for batch in dataloader:
-
-		# assuming batchsize == 1 for simpler batch handling 
-		input_ids = batch[ "input_ids" ].to( dev )
-		label_idx = batch[ "label_idx" ][ 0 ].item()
-		choices = [ c[ 0 ] for c in batch[ "choices" ] ] 
-
-		# generate string with beam search
-		gen_str = generate_beam( model, tokenizer, input_ids, max_beam_len=24, beam_width=3, dev=dev )
-
-		# compute bertscore
-		scores = my_bertscore( model, tokenizer, gen_str, choices, dev=dev )
-
-		# map to max-score choice idx
-		pred_idx = torch.argmax( scores ).item()
-		
-		if pred_idx == label_idx:
-			correct += 1
-		total += 1
-
-	acc = correct / total
-	return acc
+	eval_accuracy = correct_mappings / total_samples
+	print( f"eval complete -> mapping accuracy: { eval_accuracy * 100:.2f}%" )
+	return eval_accuracy
 
 def main():
 	parser = argparse.ArgumentParser()
@@ -760,9 +833,9 @@ def main():
 		eval_batchsize = opt.batchsize 
 	else:
 		print( "autoregressive generation with beam search" )
-		train_set = OBQAGenDataset( obqa_train_raw, tokenizer )
-		valid_set = OBQAGenDataset( obqa_valid_raw, tokenizer )
-		test_set  = OBQAGenDataset( obqa_test_raw,  tokenizer )
+		train_set = OBQAGenerationDataset( obqa_train_raw, tokenizer )
+		valid_set = OBQAGenerationDataset( obqa_valid_raw, tokenizer )
+		test_set  = OBQAGenerationDataset( obqa_test_raw,  tokenizer )
 		# enforce batch size 1 for beam generation
 		eval_batchsize = 1
 
@@ -776,7 +849,13 @@ def main():
 		if opt.mode == "cls":
 			valid_acc = eval_mcqa( model, valid_ldr, device )
 		else:
-			valid_acc = eval_gen_bertscore( model, valid_ldr, tokenizer, device )
+			valid_acc = eval_generative( 
+				model=model, 
+				data_list=obqa_valid_raw, 
+				tokenizer=tokenizer, 
+				dev=device, 
+				num_samples_to_print=3
+			)
 			
 		print( f"zero-shot baseline valid. acc.: { valid_acc * 100:.2f}%" )
 
@@ -792,9 +871,16 @@ def main():
 				valid_acc = eval_mcqa( model, valid_ldr, device )
 				print( f"epoch { epoch+1 } | train loss: { train_loss:.4f} | train acc: { train_acc*100:.2f}% | valid acc: { valid_acc*100:.2f}%" )
 			else:
-				train_loss = train_gen( model, train_ldr, optimizer, device )
-				valid_acc = eval_gen_bertscore( model, valid_ldr, tokenizer, device )
-				print( f"epoch { epoch+1 } | train Loss: { train_loss:.4f} | valid BERTScore acc: { valid_acc*100:.2f}%" )
+				train_loss, train_acc = train_generative( model, train_ldr, optimizer, device, beam_width=3, temperature=0.7 )
+				valid_acc = eval_generative( 
+					model=model, 
+					data_list=obqa_valid_raw, 
+					tokenizer=tokenizer, 
+					dev=device, 
+					num_samples_to_print=3
+				)
+
+				print( f"epoch { epoch+1 } | train loss: { train_loss:.4f} | train acc: { train_acc*100:.2f}% | valid BERTScore acc: { valid_acc*100:.2f}%" )
 
 			if valid_acc > best_valid_acc:
 				best_valid_acc = valid_acc
@@ -803,13 +889,21 @@ def main():
 				print( f"new best model weights saved to { save_path }" )
 
 		print( "start test" )
+
 		if opt.mode == "cls":
 			test_acc = eval_mcqa( model, test_ldr, device )
 		else:
-			test_acc = eval_gen_bertscore( model, test_ldr, tokenizer, device )
+			test_acc = eval_generative( 
+				model=model, 
+				data_list=obqa_test_raw, 
+				tokenizer=tokenizer, 
+				dev=device, 
+				num_samples_to_print=3
+			)
 
 		print( f"test acc: { test_acc:.4f}" )
 
 if __name__ == "__main__":
 	main()
+
 
