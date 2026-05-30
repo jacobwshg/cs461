@@ -4,10 +4,13 @@ import torch.nn as nn
 from torch.optim import AdamW
 from transformers import BertTokenizer, BertModel
 from torch.utils.data import Dataset, DataLoader
+import torch.amp as amp
 import json
 import numpy as np
 from tqdm import tqdm
 import os
+
+
 
 class OBQADataset( Dataset ):
 	def __init__( self, path, tokenizer, max_len=512 ):
@@ -23,11 +26,11 @@ class OBQADataset( Dataset ):
 	
 		instances = []
 		for ent in entries:
-			fact, stem, ch_a, ch_b, ch_c, ch_d, ans = tuple( ent.split( "|" ) )
+			fact, stem, ch_a, ch_b, ch_c, ch_d, ans_tag = tuple( ent.split( "|" ) )
 
 			choice_texts = [ ch_a, ch_b, ch_c, ch_d ]
 
-			ans_id = ord( ans[ 0 ] ) - ord( "A" )
+			ans_id = ord( ans_tag[ 0 ] ) - ord( "A" )
 
 			instances.append(
 				{
@@ -51,10 +54,11 @@ class OBQADataset( Dataset ):
 		choices   = item[ "choices" ]
 		answer_id = item[ "answer_id" ]
 
-		# prepare [CLS] <fact> <stem> <choice_text> [SEP]
+		# prepare "[CLS] <fact> <stem> <choice_text> [SEP]"
 		inputseqs = [ f"{ fact } { stem } { ch }" for ch in choices ]
 
 		def encode_seq( seq ):
+			# let tokenizer add [CLS] and [SEP]
 			return self.tokenizer(
 				seq,
 				add_special_tokens=True,
@@ -67,14 +71,13 @@ class OBQADataset( Dataset ):
 		enc_inputs = [ encode_seq( seq ) for seq in inputseqs ]
 
 		input_ids = torch.stack( [ enc[ "input_ids" ].squeeze( 0 ) for enc in enc_inputs ] )
-
 		attn_msks = torch.stack( [ enc[ "attention_mask" ].squeeze( 0 ) for enc in enc_inputs ] )
 
 		return \
 		{
 			"input_ids": input_ids,
-			"attn_msk": attn_msks,
-			"true_labels": torch.tensor( answer_id, dtype=torch.long )
+			"attn_msk" : attn_msks,
+			"labels": torch.tensor( answer_id, dtype=torch.long )
 		}
 
 class BertOBQA( nn.Module ):
@@ -86,7 +89,7 @@ class BertOBQA( nn.Module ):
 		self.dropout = nn.Dropout( dropout_rate )
 		self.hidden_sz = self.bertmodel.config.hidden_size
 
-		# score choices
+		# output layer to score choices
 		self.score_layer = nn.Linear( self.hidden_sz, 1 )
 
 	# forward a batch of samples through BERT
@@ -108,7 +111,7 @@ class BertOBQA( nn.Module ):
 			attention_mask=attn_msk_flat
 		)
 
-		# get [CLS] token embeddings ( idx 0 in seq embeddings - first token )
+		# get [CLS] token embeddings ( idx 0 in seq embeddings -> first token )
 		cls_embeds = outputs.last_hidden_state[ :, 0, : ]  # ( batch_sz * num_choices, hidden_sz )
 		cls_embeds = self.dropout( cls_embeds )
 
@@ -117,6 +120,8 @@ class BertOBQA( nn.Module ):
 		choice_scores = choice_scores.view( batch_sz, num_choices )
 
 		return choice_scores
+
+scaler = amp.GradScaler()
 
 def train_model(
 	model,
@@ -143,25 +148,41 @@ def train_model(
 
 		progbar = tqdm( train_loader, desc=f"training epoch {epoch+1}" )
 		for batch in progbar:
-			input_ids    = batch[ "input_ids" ].to( dev )
-			attn_msk     = batch[ "attn_msk" ].to( dev )
-			true_labels  = batch[ "true_labels" ].to( dev )
+
+			input_ids = batch[ "input_ids" ].to( dev )
+			attn_msk  = batch[ "attn_msk" ].to( dev )
+			labels    = batch[ "labels" ].to( dev )
 
 			optimizer.zero_grad()
 
+			"""
 			# forward
 			choice_scores = model( input_ids, attn_msk )
 
-			loss = loss_fn( choice_scores, true_labels )
+			loss = loss_fn( choice_scores, labels )
 
 			# backward
 			loss.backward()
 			optimizer.step()
+			"""
+
+			with amp.autocast(
+				device_type="cuda" if "cuda" in str( dev ) else "cpu",
+				dtype=torch.float16
+			):
+				# forward
+				choice_scores = model( input_ids, attn_msk )
+				loss = loss_fn( choice_scores, labels )
+
+			# backward
+			scaler.scale( loss ).backward()
+			scaler.step( optimizer )
+			scaler.update()
 
 			# compute accuracy
-			preds = torch.argmax( choice_scores, dim=1 )
-			train_correct += ( preds == true_labels ).sum().item()
-			train_total += true_labels.size( 0 )
+			preds = torch.argmax( choice_scores.float(), dim=1 )
+			train_correct += ( preds == labels ).sum().item()
+			train_total += labels.size( 0 )
 			total_train_loss += loss.item()
 
 			progbar.set_postfix( 
@@ -173,7 +194,7 @@ def train_model(
 
 		avg_train_loss = total_train_loss / len( train_loader )
 		train_acc = train_correct / train_total
-		
+
 		# validation
 		valid_acc = eval_model( model, valid_loader, dev )
 
@@ -185,6 +206,7 @@ def train_model(
 			torch.save( model.state_dict(), "best_openbookqa_model.pth" )
 			print( f"new best model saved with valid acc: { valid_acc:.4f}" )
 
+@torch.no_grad()
 def eval_model( model, data_loader, dev="cuda" ):
 	"""
 	evaluate model on validation/test set
@@ -197,13 +219,13 @@ def eval_model( model, data_loader, dev="cuda" ):
 		for batch in tqdm( data_loader, desc="evaluating " ):
 			input_ids = batch[ "input_ids" ].to( dev )
 			attn_msk = batch[ "attn_msk" ].to( dev )
-			true_labels = batch[ "true_labels" ].to( dev )
+			labels = batch[ "labels" ].to( dev )
 
 			choice_scores = model( input_ids, attn_msk )
 			preds = torch.argmax( choice_scores, dim=1 )
 
-			correct += ( preds == true_labels ).sum().item()
-			total += true_labels.size( 0 )
+			correct += ( preds == labels ).sum().item()
+			total += labels.size( 0 )
 
 	acc = correct / total if total > 0 else 0
 	return acc
@@ -230,8 +252,8 @@ def predict( model, data_loader, dev="cuda" ):
 def main():
 
 	MODEL_NAME = "bert-base-uncased"
-	MAX_LEN    = 256  # Adjust based on your computational resources
-	BATCH_SZ   = 8	# Reduce if running out of memory
+	MAX_LEN    = 256 
+	BATCH_SZ   = 8
 	NUM_EPOCHS = 1
 	LEARNING_RATE = 2e-5
 
@@ -268,7 +290,7 @@ def main():
 	test_loader  = DataLoader( test_set, batch_size=BATCH_SZ, shuffle=False )
 
 	# train 
-	print( "starting training..." )
+	print( "start training" )
 	train_model(
 		model=model,
 		train_loader=train_loader, valid_loader=valid_loader,
@@ -288,11 +310,11 @@ def main():
 	#print( f"test predictions shape: { len( test_predictions ) }" )
 
 	# remap answer_ids back to letters
-	preds_alpha = [ chr( ord( "A" ) + pred ) for pred in test_preds ]
+	pred_tags = [ chr( ord( "A" ) + pred ) for pred in test_preds ]
 
 	# Save results
 	with open( "predictions.json", "w" ) as f:
-		json.dump( preds_alpha, f )
+		json.dump( pred_tags, f )
 
 	print( "train and eval complete" )
 

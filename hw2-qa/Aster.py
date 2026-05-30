@@ -248,7 +248,7 @@ def read_obqa( file_name ):
 			d[ "B" ] = tokens[ 3 ]
 			d[ "C" ] = tokens[ 4 ]
 			d[ "D" ] = tokens[ 5 ]
-			d[ "Answer" ] = tokens[ 6 ]   
+			d[ "Answer" ] = tokens[ 6 ]
 			data.append( d )
 	#for i in range( 5 ):
 	#	print( i,data[ i ] )
@@ -412,8 +412,8 @@ def forward_on_qa_batch( model, batch, dev="cuda" ):
 	batch_sz, num_choices, seq_len = input_ids.shape
 
 	input_ids_flat = input_ids.view( -1, seq_len )
-	attn_msk_flat = attn_msk .view( -1, seq_len )
-	labels_flat	= labels   .view( -1, seq_len )
+	attn_msk_flat = attn_msk.view( -1, seq_len )
+	labels_flat	= labels.view( -1, seq_len )
 
 	_x, y = model( input_ids_flat, attention_mask=attn_msk_flat )
 
@@ -424,7 +424,11 @@ def forward_on_qa_batch( model, batch, dev="cuda" ):
 	loss = loss_fn( 
 		cur_logits.view( -1, cur_logits.size( -1 ) ),
 		nxt_labels.view( -1 )
-	 )
+	)
+	#
+	# ignore loss on final seq token, because we only used its label
+	# and didn't use its logit
+	#
 	loss_flat = loss.view( batch_sz * num_choices, seq_len-1 )
 
 	valid_tok_cnts = ( nxt_labels != ID_IGNORE ).sum( dim=-1 ).float()
@@ -581,7 +585,7 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 		# sort cands and keep top `beam_width`
 		cands.sort( key=lambda x: x[ 1 ], reverse=True )
 		beams = cands[ :beam_width ]
-		
+	
 		# break if all top beams hit eos
 		if all( seq[ -1 ] == tokenizer.eos_token_id for seq, _ in beams ):
 			break
