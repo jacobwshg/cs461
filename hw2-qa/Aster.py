@@ -9,9 +9,12 @@ import torch.nn.functional as F
 from transformers import GPT2TokenizerFast
 
 from torch.utils.data import Dataset, DataLoader
-import torch.cuda.amp as amp
-from tqdm import tqdm
+try:
+	import torch.amp as amp
+except:
+	import torch.cuda.amp as amp
 
+from tqdm import tqdm
 import random
 
 class GPT2Attention( nn.Module ):
@@ -399,7 +402,7 @@ def train_mcqa( model, dataloader, optimizer, dev ):
 		#
 		# use mixed precision to save memory and improve speed
 		#
-		with amp.autocast( 
+		with torch.autocast( 
 			device_type="cuda" if "cuda" in str( dev ) else "cpu",	
 			dtype=torch.float16
 		):
@@ -507,38 +510,40 @@ def beam_search( model, context_ids, beam_width=3, max_gen_len=32, temperature=1
 	for _ in range( max_gen_len ):
 		candidates = []
 
-		for beam in beams:
+		# stack all beam tokens to run a single batched forward pass
+		tok_tsrs = torch.stack( [ b[ "tokens" ] for b in beams ], dim=0 ) # ( beam_width, seq_len )
+
+		with torch.no_grad():
+			# forward
+			_, logits = model( tok_tsrs )
+			# retrieve last token's logits for all beams at once
+			nxt_tok_logits = logits[ :, -1, : ] / max( temperature, 1e-5 )
+			all_log_probs = F.log_softmax( nxt_tok_logits, dim=-1 )
+
+		# expand candidates using the batched outputs
+		for i, beam in enumerate( beams ):
 			tokens = beam[ "tokens" ]
-			
-			# avoid predicting past the maximum allowed len
+			# terminate beam if max seq len reached
 			if tokens.size( 0 ) >= model.seqlen:
 				candidates.append( beam )
 				continue
 
-			# forward pass to retrieve logits for final token
-			with torch.no_grad():
-				_, logits = model( tokens.unsqueeze( 0 ) )
-				next_token_logits = logits[ 0, -1, : ] / max( temperature, 1e-5 )
-				log_probs = F.log_softmax( next_token_logits, dim=-1 )
-
-			# select top K candidates for expansion
+			log_probs = all_log_probs[ i ]
 			topk_log_probs, topk_ids = torch.topk( log_probs, beam_width )
 
-			for i in range( beam_width ):
-				next_tok = topk_ids[ i ].unsqueeze( 0 )
+			for j in range( beam_width ):
+				# extend current top beams
+				next_tok = topk_ids[ j ].unsqueeze( 0 )
 				cand_tokens = torch.cat( [ tokens, next_tok ], dim=0 )
-				cand_log_prob = beam[ "log_prob" ] + topk_log_probs[ i ].item()
+				cand_log_prob = beam[ "log_prob" ] + topk_log_probs[ j ].item()
 				candidates.append( { "tokens": cand_tokens, "log_prob": cand_log_prob } )
 
-		# sort candidates based on cumulative log prob and retain top beams
-		candidates = sorted( candidates, key=lambda x: x[ "log_prob" ], reverse=True )
+		# re-sort cands and keep beams with highest logprobs
+		candidates = sorted( candidates, key=lambda x: x["log_prob"], reverse=True )
 		beams = candidates[ :beam_width ]
 
-		# TODO early stopping check if all top beams have finished
-
-	# return the top-scoring sequence, excluding context prefix
-	best_tokens = beams[ 0 ][ "tokens" ]
-	return best_tokens[ len( context_ids ): ]
+	# extract target tokens from top beam
+	return beams[ 0 ][ "tokens" ][ len( context_ids ): ]
 
 def compute_bertscore_wte( model, gen_ids, ref_ids ):
 	"""
@@ -595,50 +600,56 @@ def train_generative( model, dataloader, optimizer, dev, beam_width=3, temperatu
 
 		# squeeze out the batch dimension since batch_size=1
 		ctx_ids = batch[ "context_input_ids" ][ 0 ].to( dev ) # ( ctx_len )
-		choice_ids = batch[ "choice_ids" ][ 0 ].to( dev )     # ( 4, max_choice_len )
-		gt_label_idx = batch[ "label_idx" ][ 0 ].item()       # scalar
+		choice_ids = batch[ "choice_ids" ][ 0 ].to( dev )	 # ( 4, max_choice_len )
+		gt_label_idx = batch[ "label_idx" ][ 0 ].item()	   # scalar
 
-		# generation pass
-		with torch.no_grad():
-			generated_tokens = beam_search( 
-				model=model, 
-				context_ids=ctx_ids, 
-				beam_width=beam_width, 
-				temperature=temperature
-			)
+		with torch.autocast(
+			device_type="cuda" if "cuda" in str( dev ) else "cpu",
+			dtype=torch.float16
+		):
 
-		if len( generated_tokens ) == 0:
-			continue
+			# generation pass
+			with torch.no_grad():
+				generated_tokens = beam_search( 
+					model=model, 
+					context_ids=ctx_ids, 
+					beam_width=beam_width, 
+					temperature=temperature
+				)
 
-		# compute BERTScore against target labels
-		scores = []
-		for i in range( 4 ):
-			# unpad choice tokens before passing to BERTScore calculation
-			valid_choice_tokens = choice_ids[ i ][ choice_ids[ i ] != dataloader.dataset.tokenizer.pad_token_id ]
-			score = compute_bertscore_wte( model, generated_tokens, valid_choice_tokens )
-			scores.append( score )
+			if len( generated_tokens ) == 0:
+				continue
 
-		scores_tensor = torch.stack( scores )
-		predicted_choice_idx = torch.argmax( scores_tensor ).item()
+			# compute BERTScore against target labels
+			scores = []
+			ID_PAD = dataloader.dataset.tokenizer.pad_token_id
+			for i in range( 4 ):
+				# unpad choice tokens before passing to BERTScore calculation
+				valid_choice_msk = choice_ids != ID_PAD
+				valid_choice_toks = choice_ids[ valid_choice_msk ]
 
-		total_samples += 1
-		if predicted_choice_idx == gt_label_idx:
-			correct_mappings += 1
+				score = compute_bertscore_wte( model, generated_tokens, valid_choice_toks )
+				scores.append( score )
 
-		# formulate reward
-		gt_score = scores_tensor[ gt_label_idx ]
-		mask = torch.ones( 4, dtype=torch.bool, device=dev )
-		mask[ gt_label_idx ] = False
-		max_wrong_score = scores_tensor[ mask ].max()
+			scores_tensor = torch.stack( scores )
+			predicted_choice_idx = torch.argmax( scores_tensor ).item()
 
-		reward = gt_score - max_wrong_score
+			total_samples += 1
+			if predicted_choice_idx == gt_label_idx:
+				correct_mappings += 1
 
-		# minimize NLL scaled by reward performance
-		log_prob_seq = get_sequence_log_prob( model, ctx_ids, generated_tokens )
-		loss = -log_prob_seq * reward
+			wrong_choice_msk = torch.arange( 4 ) != gt_label_idx
+			wrong_choice_scores = scores_tensor[ wrong_choice_msk ]
 
-		loss.backward()
-		optimizer.step()
+			reward = scores_tensor[ gt_label_idx ] - wrong_choice_scores.max()
+
+			# minimize NLL scaled by reward performance
+			seq_log_prob = get_sequence_log_prob( model, ctx_ids, generated_tokens )
+			loss = -seq_log_prob * reward
+
+		scaler.scale( loss ).backward()
+		scaler.step( optimizer )
+		scaler.update()
 
 		total_loss += loss.item()
 
@@ -675,7 +686,10 @@ def eval_generative(
 	correct_mappings = 0
 	idx_to_tag = { 0: "A", 1: "B", 2: "C", 3: "D" }
 
-	print( f"start evaluation over { total_samples } samples. \ndetailed logs will print for indices: { list( samples_to_log ) }\n" )
+	print(
+		f"start evaluation over { total_samples } samples."
+		f"detailed logs will print for indices: { sorted( list( samples_to_log ) ) }\n"
+	)
 
 	for idx in range( total_samples ):
 		# extract original raw data tokens and dictionary attributes
