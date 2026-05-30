@@ -112,9 +112,9 @@ class TransformerGPT( nn.Module ):
 					d_ff, seqlen, 
 					attn_dropout=dropout, resid_dropout=dropout, 
 					layer_norm_epsilon=layer_norm_epsilon
-				 ) for _ in range( n_layers )
+				) for _ in range( n_layers )
 			 ]
-		 )
+		)
 
 		self.ln_f = nn.LayerNorm( d_model, eps=layer_norm_epsilon )
 
@@ -315,6 +315,7 @@ class OBQADataset( Dataset ):
 				if i < input_len:
 					choice_attnmsk[ i ] = 1
 			"""
+
 			for i in range( min( self.max_len, input_len ) ):
 				choice_attnmsk[ i ] = 1
 
@@ -324,7 +325,7 @@ class OBQADataset( Dataset ):
 				else:
 					# ID is in target
 					choice_input_ids[ i ] = trg_ids[ i-ctx_len ]
-					# only calculate loss on target tokens; mask out ctx tokens
+					# only calculate loss on target tokens; mask out label for ctx tokens
 					choice_labels[ i ] = choice_input_ids[ i ]
 
 			input_ids.append( choice_input_ids )
@@ -463,11 +464,11 @@ def train_mcqa( model, dataloader, optimizer, dev ):
 		with amp.autocast( 
 			device_type="cuda" if "cuda" in str( dev ) else "cpu",	
 			dtype=torch.float16
-		 ):
+		):
 			choice_losses, preds, batch_sz = forward_on_qa_batch( 
 				model, batch,
 				dev
-			 )
+			)
 
 			label_idxs = batch[ "label_idx" ].to( dev )
 
@@ -475,7 +476,7 @@ def train_mcqa( model, dataloader, optimizer, dev ):
 			clsn_loss = nn.CrossEntropyLoss()( 
 				-choice_losses,
 				label_idxs
-			 )
+			)
 
 		scaler.scale( clsn_loss ).backward()
 		scaler.step( optimizer )
@@ -491,8 +492,8 @@ def train_mcqa( model, dataloader, optimizer, dev ):
 			{ 
 				"loss": train_loss,
 				"acc" : train_acc
-			 }
-		 )
+			}
+		)
 
 	return train_loss, train_acc
 
@@ -508,7 +509,7 @@ def eval_mcqa( model, dataloader, dev ):
 		_choice_losses, preds, batch_sz = forward_on_qa_batch( 
 			model, batch,
 			dev
-		 )
+		)
 
 		total += batch_sz 
 		correct += ( preds == batch[ "label_idx" ].to( dev ) ).sum().item()
@@ -531,10 +532,9 @@ def train_gen( model, dataloader, optimizer, dev ):
 		with amp.autocast( 
 			device_type="cuda" if "cuda" in str( dev ) else "cpu",
 			dtype=torch.float16
-		 ):
+		):
 			_x, y = model( input_ids, attention_mask=attention_mask )
 
-			# Shift logits and labels for autoregressive language modeling
 			cur_logits = y[ ..., :-1, : ].contiguous()
 			nxt_labels = labels[ ..., 1: ].contiguous()
 
@@ -596,8 +596,53 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 	print( "generated: ", "" .join( gen_str ) )
 	return gen_str
 
-from bert_score import BERTScorer
-scorer = BERTScorer( model_type="bert-base-uncased" )
+#from bert_score import BERTScorer
+#scorer = BERTScorer( model_type="bert-base-uncased" )
+
+@torch.no_grad()
+def my_bertscore( 
+	model, tokenizer,
+	candidate, references,
+	dev="cuda"
+ ):
+	model.eval()
+
+	wte = model.wte  # word token embeddings: ( vocab_size, d_model )
+	ID_PAD = tokenizer.pad_token_id
+
+	# tokenize
+	cand_ids = tokenizer.encode( candidate, add_special_tokens=False )
+	ref_id_lists = [ tokenizer.encode( r, add_special_tokens=False ) for r in references ]
+
+	# Convert to tensors and pad
+	max_len = max( len( cand_ids ), max( len( r ) for r in ref_id_lists ) )
+
+	def pad_to_max( ids ):
+		return ids + [ ID_PAD ] * ( max_len - len( ids ) )
+
+	cand_tsr = torch.tensor( [ pad_to_max( cand_ids ) ], device=dev )  # ( 1, L )
+	ref_tsrs = torch.tensor( [ pad_to_max( r ) for r in ref_id_lists ], device=dev )  # ( N, L )
+
+	# create masks
+	cand_msk = ( cand_tsr != ID_PAD ).float()  # ( 1, L )
+	ref_msks = ( ref_tsrs != ID_PAD ).float()  # ( N, L )
+	# map IDs to embeddings
+	cand_embed = wte( cand_tsr )  # ( 1, L, d )
+	ref_embeds = wte( ref_tsrs )  # ( N, L, d )
+
+	# mean pooling ( ignore pad )
+	cand_mean = ( cand_embed * cand_msk.unsqueeze( -1 ) ).sum( 1 ) \
+		/ cand_msk.sum( 1, keepdim=True ).clamp( min=1 )  # ( 1, d )
+
+	ref_means = ( ref_embeds * ref_msks.unsqueeze( -1 ) ).sum( 1 ) \
+		/ ref_msks.sum( 1, keepdim=True ).clamp( min=1 )  # ( N, d )
+
+	# cosine similarity
+	cand_norm = F.normalize( cand_mean, p=2, dim=-1 ) # ( 1, d )
+	ref_norms = F.normalize( ref_means, p=2, dim=-1 ) # ( N, d )
+	scores = torch.mm( cand_norm, ref_norms.t() ).squeeze( 0 ) # ( N, )
+
+	return scores # higher = more similar
 
 @torch.no_grad()
 def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
@@ -612,19 +657,16 @@ def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
 		# assuming batchsize == 1 for simpler batch handling 
 		input_ids = batch[ "input_ids" ].to( dev )
 		label_idx = batch[ "label_idx" ].item()
-
-		gen_str = generate_beam( model, tokenizer, input_ids, max_beam_len=24, beam_width=3, dev=dev )
-
-		# unpack candidates 
 		choices = [ c[ 0 ] for c in batch[ "choices" ] ] 
 
-		# replicate generation output to match candidate choices length
-		references = [ gen_str ] * len( choices )
+		# generate string with beam search
+		gen_str = generate_beam( model, tokenizer, input_ids, max_beam_len=24, beam_width=3, dev=dev )
 
-		_, _, f1 = scorer.score( choices, references )
+		# compute bertscore
+		scores = my_bertscore( model, tokenizer, gen_str, choices, dev=dev )
 
-		# 4. Map to the choice maximizing F1 similarity metric
-		pred_idx = torch.argmax( f1 ).item()
+		# map to max-score choice idx
+		pred_idx = torch.argmax( scores ).item()
 		
 		if pred_idx == label_idx:
 			correct += 1
@@ -664,14 +706,14 @@ def main():
 		choices=[ "cls", "gen" ], 
 		default="",
 		help="whether to run multiple-choice classification or autoregressive sequence generation."
-	 )
+	)
 	parser.add_argument( 
 		"-task_type", 
 		type=str,
 		choices=[ "ZS", "FT" ], 
 		default="FT",
 		help="zero-shot skips training and evaluates the base weights. fine-tuned trains the model first."
-	 )
+	)
 
 	opt = parser.parse_args()
 	
@@ -679,7 +721,7 @@ def main():
 		"cuda:0" \
 		if torch.cuda.is_available() and not opt.no_cuda \
 		else "cpu"
-	 )
+	)
 
 	tokenizer = GPT2TokenizerFast.from_pretrained( opt.tokenizer_dir )
 	tokenizer.model_max_length = 10**9
@@ -695,7 +737,7 @@ def main():
 		opt.d_model, opt.n_layers, 
 		opt.heads, opt.seqlen, opt.d_ff, 
 		opt.dropout, opt.epsilon
-	 )
+	)
 	model.load_state_dict( state_dict, strict=True )
 	model.to( device )
 
