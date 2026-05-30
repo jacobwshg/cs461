@@ -122,7 +122,6 @@ class TransformerGPT( nn.Module ):
 		self.lm_head.weight = self.wte.weight
 
 	def forward( self, input_ids, attention_mask=None ):
-		print( input_ids.shape )
 		bsz, seq_len = input_ids.shape
 
 		if seq_len > self.seqlen:
@@ -562,12 +561,13 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 	actual_len = ( input_ids != tokenizer.pad_token_id ).sum().item()
 	beams = [ ( input_ids[ 0, :actual_len ].tolist(), 0.0 ) ] # ( token_list, log_prob )
 
-	for _ in range( max_beam_len ):
+	for l in range( max_beam_len ):
 		cands = []
 
 		for seq, score in beams:
 			if seq[ -1 ] == tokenizer.eos_token_id:
 				# beam terminated
+				##print( "beam terminated at len ", l )
 				cands.append( ( seq, score ) )
 				continue
 
@@ -588,12 +588,13 @@ def generate_beam( model, tokenizer, input_ids, max_beam_len=20, beam_width=3, d
 	
 		# break if all top beams hit eos
 		if all( seq[ -1 ] == tokenizer.eos_token_id for seq, _ in beams ):
+			##print( "all beams @ eos" )
 			break
 
 	best_seq = beams[ 0 ][ 0 ]
 	gen_toks = best_seq[ actual_len: ]
-	gen_str = tokenizer.decode( gen_toks, skip_special_tokens=True ).strip()
-	print( "generated: ", "" .join( gen_str ) )
+	gen_str = tokenizer.decode( gen_toks, skip_special_tokens=False )
+	print( "generated: ", f"len { len( gen_toks ) } ", " ".join( gen_str ) )
 	return gen_str
 
 #from bert_score import BERTScorer
@@ -604,7 +605,7 @@ def my_bertscore(
 	model, tokenizer,
 	candidate, references,
 	dev="cuda"
- ):
+):
 	model.eval()
 
 	wte = model.wte  # word token embeddings: ( vocab_size, d_model )
@@ -647,7 +648,6 @@ def my_bertscore(
 @torch.no_grad()
 def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
 
-
 	model.eval()
 	correct, total = 0, 0
 
@@ -656,7 +656,7 @@ def eval_gen_bertscore( model, dataloader, tokenizer, dev ):
 
 		# assuming batchsize == 1 for simpler batch handling 
 		input_ids = batch[ "input_ids" ].to( dev )
-		label_idx = batch[ "label_idx" ].item()
+		label_idx = batch[ "label_idx" ][ 0 ].item()
 		choices = [ c[ 0 ] for c in batch[ "choices" ] ] 
 
 		# generate string with beam search
@@ -772,11 +772,11 @@ def main():
 
 	if opt.task_type == "ZS":
 		print( f"--- zero-shot evaluation ---" )
-		
+
 		if opt.mode == "cls":
 			valid_acc = eval_mcqa( model, valid_ldr, device )
 		else:
-			valid_acc = eval_generative_bertscore( model, valid_ldr, tokenizer, device )
+			valid_acc = eval_gen_bertscore( model, valid_ldr, tokenizer, device )
 			
 		print( f"zero-shot baseline valid. acc.: { valid_acc * 100:.2f}%" )
 
@@ -785,6 +785,7 @@ def main():
 		optimizer = torch.optim.AdamW( model.parameters(), lr=opt.lr )
 		best_valid_acc = 0.0	
 
+		print( "start training" )
 		for epoch in range( opt.epochs ):
 			if opt.mode == "cls":
 				train_loss, train_acc = train_mcqa( model, train_ldr, optimizer, device )
@@ -800,6 +801,14 @@ def main():
 				save_path = f"aster_{ opt.mode }_obqa.pt"
 				torch.save( { "model_state_dict": model.state_dict() }, save_path )
 				print( f"new best model weights saved to { save_path }" )
+
+		print( "start test" )
+		if opt.mode == "cls":
+			test_acc = eval_mcqa( model, test_ldr, device )
+		else:
+			test_acc = eval_gen_bertscore( model, test_ldr, tokenizer, device )
+
+		print( f"test acc: { test_acc:.4f}" )
 
 if __name__ == "__main__":
 	main()
