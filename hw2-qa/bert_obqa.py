@@ -4,13 +4,19 @@ import torch.nn as nn
 from torch.optim import AdamW
 from transformers import BertTokenizer, BertModel
 from torch.utils.data import Dataset, DataLoader
-import torch.amp as amp
 import json
 import numpy as np
 from tqdm import tqdm
 import os
+import argparse
+
+try:
+	import torch.amp as amp
+except:
+	import torch.cuda.amp as amp
 
 
+SAVE_PATH = "./best_bert_obqa.pt"
 
 class OBQADataset( Dataset ):
 	def __init__( self, path, tokenizer, max_len=512 ):
@@ -126,6 +132,7 @@ scaler = amp.GradScaler()
 def train_model(
 	model,
 	train_loader, valid_loader,
+	save_path=SAVE_PATH,
 	num_epochs=2, lr=2e-5, 
 	dev="cuda"
 ):
@@ -155,18 +162,7 @@ def train_model(
 
 			optimizer.zero_grad()
 
-			"""
-			# forward
-			choice_scores = model( input_ids, attn_msk )
-
-			loss = loss_fn( choice_scores, labels )
-
-			# backward
-			loss.backward()
-			optimizer.step()
-			"""
-
-			with amp.autocast(
+			with torch.autocast(
 				device_type="cuda" if "cuda" in str( dev ) else "cpu",
 				dtype=torch.float16
 			):
@@ -203,7 +199,7 @@ def train_model(
 		# save best model
 		if valid_acc > best_valid_acc:
 			best_valid_acc = valid_acc
-			torch.save( model.state_dict(), "best_openbookqa_model.pth" )
+			torch.save( model.state_dict(), save_path )
 			print( f"new best model saved with valid acc: { valid_acc:.4f}" )
 
 @torch.no_grad()
@@ -251,60 +247,87 @@ def predict( model, data_loader, dev="cuda" ):
 
 def main():
 
-	MODEL_NAME = "bert-base-uncased"
-	MAX_LEN    = 256 
-	BATCH_SZ   = 8
-	NUM_EPOCHS = 1
-	LEARNING_RATE = 2e-5
+	BASE_MODEL_NAME = "bert-base-uncased"
+
+	parser = argparse.ArgumentParser()
+
+	parser.add_argument( "-save_path", type=str, default=SAVE_PATH )
+	parser.add_argument( "-max_len",   type=int, default=256 )
+	parser.add_argument( "-batchsize", type=int, default=4 )
+	parser.add_argument( "-epochs",    type=int, default=1 )
+	parser.add_argument( "-lr",        type=float, default=2e-5 )
+	parser.add_argument( "-task_type", type=str, default="ZS", help="ZS for zero-shot, FT for fine-tuned" )
+	parser.add_argument( "-train_path", type=str, default="obqa/obqa.train.txt" )
+	parser.add_argument( "-valid_path", type=str, default="obqa/obqa.valid.txt" )
+	parser.add_argument( "-test_path",  type=str, default="obqa/obqa.test.txt" )
+
+	opt = parser.parse_args()
 
 	dev = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
+
 	print( f"using device: { dev }" )
+	print( f"task type:", opt.task_type )
+	print( f"save path ( if fine-tuning ): ", opt.save_path )
+	print( f"training epochs ( if fine-tuning ): ", opt.epochs )
+	print( f"batchsize: ", opt.batchsize )
 
 	# initialize
-	model = BertOBQA( MODEL_NAME )
-	tokenizer = BertTokenizer.from_pretrained( MODEL_NAME )
+	model = BertOBQA( BASE_MODEL_NAME )
+	model.to( dev )
+	tokenizer = BertTokenizer.from_pretrained( BASE_MODEL_NAME )
 
 	# add special tokens if needed ( though we're using existing ones )
-	tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+	tokenizer.add_special_tokens( { "pad_token": "[PAD]" } )
 
 	# instantiate datasets
 	train_set = OBQADataset(
-		path="obqa/obqa.train.txt",
+		path=opt.train_path,
 		tokenizer=tokenizer, 
-		max_len=MAX_LEN
+		max_len=opt.max_len
 	)
 	valid_set = OBQADataset(
-		path="obqa/obqa.valid.txt",
+		path=opt.valid_path,
 		tokenizer=tokenizer, 
-		max_len=MAX_LEN
+		max_len=opt.max_len
 	)
 	test_set = OBQADataset(
-		path="obqa/obqa.test.txt",
+		path=opt.test_path,
 		tokenizer=tokenizer, 
-		max_len=MAX_LEN
+		max_len=opt.max_len
 	)
 
 	# create data loaders
-	train_loader = DataLoader( train_set, batch_size=BATCH_SZ, shuffle=True )
-	valid_loader = DataLoader( valid_set, batch_size=BATCH_SZ, shuffle=False )
-	test_loader  = DataLoader( test_set, batch_size=BATCH_SZ, shuffle=False )
+	train_loader = DataLoader( train_set, batch_size=opt.batchsize, shuffle=True )
+	valid_loader = DataLoader( valid_set, batch_size=opt.batchsize, shuffle=False )
+	test_loader  = DataLoader( test_set, batch_size=opt.batchsize, shuffle=False )
 
-	# train 
-	print( "start training" )
-	train_model(
-		model=model,
-		train_loader=train_loader, valid_loader=valid_loader,
-		num_epochs=NUM_EPOCHS, lr=LEARNING_RATE,
-		dev=dev
-	)
+	if opt.task_type == "FT":
 
-	# load best model for final evaluation
-	model.load_state_dict( torch.load( "best_openbookqa_model.pth" ) )
+		# train 
+		print( "start fine-tuned training" )
+		train_model(
+			model=model,
+			train_loader=train_loader, valid_loader=valid_loader,
+			save_path=opt.save_path,
+			num_epochs=opt.epochs, lr=opt.lr,
+			dev=dev
+		)
+
+		# load best model for final evaluation
+		model.load_state_dict( torch.load( opt.save_path ) )
+
+	else:
+		print( "zero-shot evaluation" )
 
 	# eval on validation set
 	valid_acc = eval_model( model, valid_loader, dev )
 	print( f"final validation accuracy: { valid_acc:.4f}" )
 
+	# eval on test set
+	test_acc = eval_model( model, test_loader, dev )
+	print( f"final test accuracy: { test_acc:.4f}" )
+
+	"""
 	# predict on test set
 	test_preds = predict( model, test_loader, dev )
 	#print( f"test predictions shape: { len( test_predictions ) }" )
@@ -312,9 +335,10 @@ def main():
 	# remap answer_ids back to letters
 	pred_tags = [ chr( ord( "A" ) + pred ) for pred in test_preds ]
 
-	# Save results
+	# save results
 	with open( "predictions.json", "w" ) as f:
 		json.dump( pred_tags, f )
+	"""
 
 	print( "train and eval complete" )
 
