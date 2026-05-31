@@ -587,7 +587,10 @@ def get_sequence_log_prob( model, context_ids, gen_ids ):
 	return target_log_probs.sum()
 
 
-def train_generative( model, dataloader, optimizer, dev, beam_width=3, temperature=0.7 ):
+def train_generative(
+	model, dataloader, optimizer, device,
+	beam_width=3, max_seq_len=16, temperature=0.7
+):
 	model.train()
 	total_loss = 0.0
 	total_samples = 0
@@ -599,12 +602,12 @@ def train_generative( model, dataloader, optimizer, dev, beam_width=3, temperatu
 		optimizer.zero_grad()
 
 		# squeeze out the batch dimension since batch_size=1
-		ctx_ids = batch[ "context_input_ids" ][ 0 ].to( dev ) # ( ctx_len )
-		choice_ids = batch[ "choice_ids" ][ 0 ].to( dev )	 # ( 4, max_choice_len )
+		ctx_ids = batch[ "context_input_ids" ][ 0 ].to( device ) # ( ctx_len )
+		choice_ids = batch[ "choice_ids" ][ 0 ].to( device )	 # ( 4, max_choice_len )
 		gt_label_idx = batch[ "label_idx" ][ 0 ].item()	   # scalar
 
 		with torch.autocast(
-			device_type="cuda" if "cuda" in str( dev ) else "cpu",
+			device_type="cuda" if "cuda" in str( device ) else "cpu",
 			dtype=torch.float16
 		):
 
@@ -785,9 +788,10 @@ def main():
 	parser.add_argument( "-valid_path", type=str, default="obqa/obqa.valid.txt" )
 	parser.add_argument( "-test_path" , type=str, default="obqa/obqa.test.txt" )
 
-	parser.add_argument( "-no_cuda", action="store_true" )
-
-	parser.add_argument( "-print_beam_samples", type=int, default=5 )
+	parser.add_argument( "-beam_width", type=int, default=3 )
+	parser.add_argument( "-beam_len", type=int, default=16 )
+	parser.add_argument( "-beam_temp", type=float, default=0.7 )
+	parser.add_argument( "-print_beam_samples", type=int, default=10 )
 
 	parser.add_argument( 
 		"-mode", 
@@ -805,12 +809,12 @@ def main():
 	)
 
 	opt = parser.parse_args()
-	
-	device = torch.device( 
-		"cuda:0" \
-		if torch.cuda.is_available() and not opt.no_cuda \
-		else "cpu"
-	)
+
+	t = opt.beam_temp
+	t = min( 1.0, max( 0.0, t ) )
+	opt.beam_temp = t
+
+	device = torch.device( "cuda" if torch.cuda.is_available() else "cpu" )
 
 	tokenizer = GPT2TokenizerFast.from_pretrained( opt.tokenizer_dir )
 	tokenizer.model_max_length = 10**9
@@ -887,7 +891,12 @@ def main():
 				valid_acc = eval_mcqa( model, valid_ldr, device )
 				print( f"epoch { epoch+1 } | train loss: { train_loss:.4f} | train acc: { train_acc*100:.2f}% | valid acc: { valid_acc*100:.2f}%" )
 			else:
-				train_loss, train_acc = train_generative( model, train_ldr, optimizer, device, beam_width=3, temperature=0.7 )
+				train_loss, train_acc = train_generative(
+					model, train_ldr, optimizer, device, 
+					beam_width=opt.beam_width,
+					max_seq_len=opt.beam_len,
+					temperature=opt.beam_temp
+				)
 				valid_acc = eval_generative( 
 					model=model, 
 					data_list=obqa_valid_raw, 
@@ -906,18 +915,18 @@ def main():
 
 		print( "start test" )
 
-		if opt.mode == "cls":
-			test_acc = eval_mcqa( model, test_ldr, device )
-		else:
-			test_acc = eval_generative( 
-				model=model, 
-				data_list=obqa_test_raw, 
-				tokenizer=tokenizer, 
-				dev=device, 
-				num_samples_to_print=3
-			)
+	if opt.mode == "cls":
+		test_acc = eval_mcqa( model, test_ldr, device )
+	else:
+		test_acc = eval_generative( 
+			model=model, 
+			data_list=obqa_test_raw, 
+			tokenizer=tokenizer, 
+			dev=device, 
+			num_samples_to_print=opt.print_beam_samples
+		)
 
-		print( f"test acc: { test_acc:.4f}" )
+	print( f"test acc: { test_acc:.4f}" )
 
 if __name__ == "__main__":
 	main()

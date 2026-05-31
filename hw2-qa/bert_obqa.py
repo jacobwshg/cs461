@@ -60,6 +60,7 @@ class OBQADataset( Dataset ):
 		choices   = item[ "choices" ]
 		answer_id = item[ "answer_id" ]
 
+		##"""
 		# prepare "[CLS] <fact> <stem> <choice_text> [SEP]"
 		inputseqs = [ f"{ fact } { stem } { ch }" for ch in choices ]
 
@@ -75,6 +76,21 @@ class OBQADataset( Dataset ):
 			)
 
 		enc_inputs = [ encode_seq( seq ) for seq in inputseqs ]
+		##"""
+
+		"""
+		enc_inputs = []
+		for c in choices:
+			enc_seq = self.tokenizer(
+				text="{ fact } { stem }", text_pair=c,
+				add_special_tokens=True,
+				max_length=self.max_len,
+				padding="max_length",
+				truncation=True,
+				return_tensors="pt"
+			)
+			enc_inputs.append( enc_seq )
+		"""
 
 		input_ids = torch.stack( [ enc[ "input_ids" ].squeeze( 0 ) for enc in enc_inputs ] )
 		attn_msks = torch.stack( [ enc[ "attention_mask" ].squeeze( 0 ) for enc in enc_inputs ] )
@@ -127,8 +143,6 @@ class BertOBQA( nn.Module ):
 
 		return choice_scores
 
-scaler = amp.GradScaler()
-
 def train_model(
 	model,
 	train_loader, valid_loader,
@@ -152,6 +166,8 @@ def train_model(
 		total_train_loss = 0
 		train_correct = 0
 		train_total = 0
+
+		scaler = amp.GradScaler()
 
 		progbar = tqdm( train_loader, desc=f"training epoch {epoch+1}" )
 		for batch in progbar:
