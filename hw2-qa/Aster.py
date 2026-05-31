@@ -497,7 +497,7 @@ class OBQAGenerationDataset( Dataset ):
 		}
 
 
-def beam_search( model, context_ids, beam_width=3, max_gen_len=32, temperature=1.0, pad_token_id=0 ):
+def beam_search( model, context_ids, beam_width=3, max_gen_len=16, temperature=1.0, pad_token_id=0 ):
 	"""
 	perform token-by-token beam search tracking cumulative log probs
 	"""
@@ -787,6 +787,8 @@ def main():
 
 	parser.add_argument( "-no_cuda", action="store_true" )
 
+	parser.add_argument( "-print_beam_samples", type=int, default=5 )
+
 	parser.add_argument( 
 		"-mode", 
 		type=str, 
@@ -868,7 +870,7 @@ def main():
 				data_list=obqa_valid_raw, 
 				tokenizer=tokenizer, 
 				dev=device, 
-				num_samples_to_print=3
+				num_samples_to_print=opt.print_beam_samples
 			)
 			
 		print( f"zero-shot baseline valid. acc.: { valid_acc * 100:.2f}%" )
@@ -891,7 +893,7 @@ def main():
 					data_list=obqa_valid_raw, 
 					tokenizer=tokenizer, 
 					dev=device, 
-					num_samples_to_print=3
+					num_samples_to_print=opt.print_beam_samples
 				)
 
 				print( f"epoch { epoch+1 } | train loss: { train_loss:.4f} | train acc: { train_acc*100:.2f}% | valid BERTScore acc: { valid_acc*100:.2f}%" )
