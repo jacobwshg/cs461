@@ -85,14 +85,14 @@ class GPT2MLP( nn.Module ):
 
 # adapter
 class AdapterBlock( nn.Module ):
-	def __init__( self, d_model, bottleneck_dim, dropout=0.0 ):
+	def __init__( self, d_model, d_bottleneck, dropout=0.0 ):
 		super().__init__()
 
-		self.down_proj = nn.Linear( d_model, bottleneck_dim )
+		self.down_proj = nn.Linear( d_model, d_bottleneck )
 
 		self.act = nn.GELU()
 
-		self.up_proj = nn.Linear( bottleneck_dim, d_model )
+		self.up_proj = nn.Linear( d_bottleneck, d_model )
 
 		self.dropout = nn.Dropout( dropout )
 		
@@ -110,6 +110,7 @@ class AdapterBlock( nn.Module ):
 class GPT2Block( nn.Module ):
 	def __init__(
 		self, d_model, heads, d_ff, max_seq_len,
+		d_bottleneck=64,
 		attn_dropout=0.0, resid_dropout=0.0, layer_norm_epsilon=1e-5
 	):
 		super().__init__()
@@ -117,12 +118,12 @@ class GPT2Block( nn.Module ):
 		self.ln_1 = nn.LayerNorm( d_model, eps=layer_norm_epsilon )
 		self.attn = GPT2Attention( d_model, heads, max_seq_len, attn_dropout=attn_dropout, resid_dropout=resid_dropout )
 
-		self.adapter_attn = AdapterBlock(d_model, bottleneck_dim, dropout=resid_dropout)
+		self.adapter_attn = AdapterBlock(d_model, d_bottleneck, dropout=resid_dropout)
 
 		self.ln_2 = nn.LayerNorm( d_model, eps=layer_norm_epsilon )
 		self.mlp = GPT2MLP( d_model, d_ff, resid_dropout=resid_dropout )
 
-		self.adapter_mlp = AdapterBlock(d_model, bottleneck_dim, dropout=resid_dropout)
+		self.adapter_mlp = AdapterBlock(d_model, d_bottleneck, dropout=resid_dropout)
 
 	def forward( self, x, attention_mask=None ):
 		attn_out = self.attn( self.ln_1( x ), attention_mask=attention_mask )
@@ -134,7 +135,11 @@ class GPT2Block( nn.Module ):
 		return x
 
 class TransformerGPT( nn.Module ):
-	def __init__( self, vocab_size, d_model, n_layers, heads, seqlen, d_ff, dropout=0.0, layer_norm_epsilon=1e-5 ):
+	def __init__(
+		self, vocab_size, d_model, n_layers, heads, seqlen, d_ff,
+		d_bottleneck=64,
+		dropout=0.0, layer_norm_epsilon=1e-5
+	):
 		super().__init__()
 
 		self.seqlen = seqlen
@@ -152,6 +157,7 @@ class TransformerGPT( nn.Module ):
 				GPT2Block( 
 					d_model, heads, 
 					d_ff, seqlen, 
+					d_bottleneck=d_bottleneck,
 					attn_dropout=dropout, resid_dropout=dropout, 
 					layer_norm_epsilon=layer_norm_epsilon
 				) for _ in range( n_layers )
@@ -510,6 +516,8 @@ def main():
 	parser.add_argument( "-heads", type=int, default=16 )
 	parser.add_argument( "-seqlen", type=int, default=1024 )
 	parser.add_argument( "-batchsize", type=int, default=1 )
+
+	parser.add_argument( "-d_bottleneck", type=int, default=64 )
 
 	parser.add_argument( "-dropout", type=float, default=0.0 )
 	parser.add_argument( "-epsilon", type=float, default=1e-5 )
